@@ -18,4 +18,4 @@ BSC_NODE_URL = os.getenv("BSC_NODE_URL")
 
 bot = Bot(token=TOKEN)
 
-async
+async def start_trading():
