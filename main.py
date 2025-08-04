@@ -1,32 +1,21 @@
-import requests
-import json
-import time
 import os
-from telegram import Bot
+import logging
+from telegram import Bot, Update, InputFile
+from telegram.ext import CommandHandler, ApplicationBuilder, ContextTypes
+from breakout_strategy import detect_breakout
+from scam_filter import is_legit_token
 
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-RPC_URL = os.environ.get("RPC_URL")
+# Setup logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
 
-bot = Bot(token=TELEGRAM_TOKEN)
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+WALLET_ADDRESS = os.getenv("WALLET_ADDRESS")
+ETH_NODE_URL = os.getenv("ETH_NODE_URL")
+BSC_NODE_URL = os.getenv("BSC_NODE_URL")
 
-def check_price():
-    price = 3000  # Placeholder, replace with live logic later
-    return price
+bot = Bot(token=TOKEN)
 
-def notify(price):
-    message = f"Current simulated ETH price is ${price}"
-    bot.send_message(chat_id=CHAT_ID, text=message)
-
-def main():
-    while True:
-        try:
-            price = check_price()
-            notify(price)
-            time.sleep(60)
-        except Exception as e:
-            bot.send_message(chat_id=CHAT_ID, text=f"Error: {e}")
-            time.sleep(60)
-
-if __name__ == "__main__":
-    main()
+async
