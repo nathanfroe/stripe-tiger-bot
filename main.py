@@ -1,43 +1,33 @@
-from dotenv import load_dotenv
-load_dotenv()
 import os
 import logging
-from telegram import Bot, Update
+from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-from breakout_strategy import detect_breakout
-from scam_filter import is_legit_token
-
-# Setup logging
+# Logging setup
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 
-# Environment variables
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-WALLET_ADDRESS = os.getenv("WALLET_ADDRESS")
-ETH_NODE_URL = os.getenv("ETH_NODE_URL")
-BSC_NODE_URL = os.getenv("BSC_NODE_URL")
+# Read Telegram Bot Token from Render environment variable
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 
-# Command: /start
+if not TELEGRAM_TOKEN:
+    raise RuntimeError("TELEGRAM_TOKEN environment variable not found. Set it in Render dashboard.")
+
+# Basic /start command
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🤖 Stripe Tiger Bot is active and watching for breakout tokens!")
+    await update.message.reply_text("Hello! The Stripe Tiger Bot is running successfully!")
 
-# Placeholder for the main trading logic
-async def start_trading():
-    pass
-
-# Bot entry point
+# Entry point
 def main():
-    app = ApplicationBuilder().token(TOKEN).build()
-    
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+
+    # Register command handlers
     app.add_handler(CommandHandler("start", start))
 
-    # Optional: you could run start_trading here if needed
-    # asyncio.create_task(start_trading())
-
+    # Run the bot
     app.run_polling()
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
