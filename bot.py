@@ -1,54 +1,50 @@
 import os
+import logging
 import time
-import traceback
-import schedule
-from datetime import datetime
-import requests
+from telegram import Update
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
+)
 
-# === Environment Variables ===
-TRADE_MODE = os.getenv("TRADE_MODE", "mock")
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+# --- Logging Setup ---
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
-# === Telegram Alert Function ===
-def send_telegram_message(message):
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        data = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
-        response = requests.post(url, data=data)
-        response.raise_for_status()
-    except Exception as e:
-        print(f"Failed to send Telegram message: {e}")
+# --- Environment Variables ---
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+RENDER_EXTERNAL_HOSTNAME = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
 
-# === Heartbeat Logger ===
-def heartbeat():
-    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-    send_telegram_message(f"💓 Heartbeat — Bot is alive at {now} in {TRADE_MODE.upper()} mode.")
+# --- Bot Commands ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🤖 Bot is alive and running (webhook mode)!")
 
-# === Trade Simulation (Mock) ===
-def mock_trade():
-    # Sample simulation for demonstration
-    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-    decision = "BUY" if int(time.time()) % 2 == 0 else "SELL"
-    message = f"📈 {decision} signal triggered at {now} (simulated)"
-    send_telegram_message(message)
+async def heartbeat(context: ContextTypes.DEFAULT_TYPE):
+    await context.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="✅ Heartbeat: Bot is alive.")
 
-# === Main Bot Runner ===
-def run_bot():
-    try:
-        heartbeat()
-        mock_trade()
-        # Add real trading logic here as needed
-    except Exception as e:
-        error_msg = f"⚠️ ERROR in bot loop: {e}\n{traceback.format_exc()}"
-        send_telegram_message(error_msg)
+# --- Main App ---
+def main():
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID or not RENDER_EXTERNAL_HOSTNAME:
+        raise RuntimeError("Missing one or more required environment variables.")
 
-# === Scheduler Setup ===
-schedule.every(1).minutes.do(run_bot)
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
-# === Initial Startup ===
-send_telegram_message("✅ Stripe Tiger bot is live and hunting (logging mode enabled).")
+    app.add_handler(CommandHandler("start", start))
 
-while True:
-    schedule.run_pending()
-    time.sleep(1)
+    # Heartbeat every 15 minutes
+    app.job_queue.run_repeating(heartbeat, interval=900, first=10)
+
+    # --- Webhook Setup ---
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=int(os.environ.get("PORT", "10000")),
+        url_path=TELEGRAM_TOKEN,
+        webhook_url=f"https://{RENDER_EXTERNAL_HOSTNAME}/{TELEGRAM_TOKEN}",
+    )
+
+if __name__ == "__main__":
+    main()
