@@ -1,34 +1,26 @@
-import time
 import random
-from ai_brain import score_token, record_trade
-from auto_trader import trade_token
-from token_logger import log_token
+import time
+from ai_brain import record_trade, get_brain_summary
 
-MOCK_TOKENS = [
-    {"name": "TestCoin1", "address": "0x1111", "liquidity": 15000, "holders": 5200},
-    {"name": "TestCoin2", "address": "0x2222", "liquidity": 3000, "holders": 1800},
-    {"name": "TestCoin3", "address": "0x3333", "liquidity": 50000, "holders": 11000},
-    {"name": "TestCoin4", "address": "0x4444", "liquidity": 900, "holders": 350},
-    {"name": "TestCoin5", "address": "0x5555", "liquidity": 18000, "holders": 8000},
-]
+# Simulated mock trading for training purposes only
 
-def simulate_mock_trades():
-    print("[AI TEST] Running mock trade simulation...")
-    for token in MOCK_TOKENS:
-        score = score_token(token)
-        if score < 60:
-            log_token(token, action="skipped", reason=f"Low score: {score}")
-            continue
+def simulate_mock_trade():
+    decision = random.choice(["buy", "sell"])
+    amount = round(random.uniform(0.01, 0.1), 4)
+    price = round(random.uniform(900, 3100), 2)
+    result = round(random.uniform(-25, 75), 2)
+    record_trade(decision, amount, price, result)
+    print(f"MOCK {decision.upper()} | Amount: {amount} | Price: {price} | P/L: {result}")
 
-        result = trade_token(token["address"], chain="bsc")
-        record_trade(
-            token["address"],
-            profit=result.get("profit", 0),
-            outcome=result.get("status"),
-            notes="simulation"
-        )
-        print(f"[SIMULATED] {token['name']} | {result}")
-        time.sleep(2)
+def run_mock_trading_session(duration_minutes=5):
+    print("Starting mock trading session...")
+    start = time.time()
+    while time.time() - start < duration_minutes * 60:
+        simulate_mock_trade()
+        time.sleep(30)  # Run a mock trade every 30 seconds
+
+    summary = get_brain_summary()
+    print("Session Summary:", summary)
 
 if __name__ == "__main__":
-    simulate_mock_trades()
+    run_mock_trading_session()
