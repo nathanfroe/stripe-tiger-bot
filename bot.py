@@ -1,49 +1,41 @@
 import os
 import logging
-import time
-from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    ContextTypes,
-)
+from telegram import Update, Bot
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-# --- Logging Setup ---
+# Load from environment
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # e.g., https://stripe-tiger-bot.onrender.com/webhook
+
+# Logging setup
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
-logger = logging.getLogger(__name__)
 
-# --- Environment Variables ---
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-RENDER_EXTERNAL_HOSTNAME = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
-
-# --- Bot Commands ---
+# Handlers
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🤖 Bot is alive and running (webhook mode)!")
+    await update.message.reply_text("Stripe Tiger bot is live and hunting.")
 
-async def heartbeat(context: ContextTypes.DEFAULT_TYPE):
-    await context.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="✅ Heartbeat: Bot is alive.")
+async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Buy command received.")
 
-# --- Main App ---
+async def sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Sell command received.")
+
+# Webhook-based startup
 def main():
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID or not RENDER_EXTERNAL_HOSTNAME:
-        raise RuntimeError("Missing one or more required environment variables.")
-
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    bot = Bot(token=BOT_TOKEN)
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("buy", buy))
+    app.add_handler(CommandHandler("sell", sell))
 
-    # Heartbeat every 15 minutes
-    app.job_queue.run_repeating(heartbeat, interval=900, first=10)
-
-    # --- Webhook Setup ---
+    # Set webhook
     app.run_webhook(
         listen="0.0.0.0",
-        port=int(os.environ.get("PORT", "10000")),
-        url_path=TELEGRAM_TOKEN,
-        webhook_url=f"https://{RENDER_EXTERNAL_HOSTNAME}/{TELEGRAM_TOKEN}",
+        port=int(os.environ.get("PORT", 10000)),
+        webhook_url=WEBHOOK_URL,
     )
 
 if __name__ == "__main__":
