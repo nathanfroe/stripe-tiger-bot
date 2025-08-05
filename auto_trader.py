@@ -1,41 +1,31 @@
-from web3 import Web3
 import os
-import json
+import time
 import random
+from ai_brain import record_trade
 
-BSC_RPC = os.getenv("BSC_RPC")
-ETH_RPC = os.getenv("ETH_RPC")
-BSC_WALLET = os.getenv("BSC_WALLET")
-ETH_WALLET = os.getenv("ETH_WALLET")
-TRADE_MODE = os.getenv("TRADE_MODE", "mock")  # mock or live
+# Simulated trading logic for live execution
 
-# Routers
-UNISWAP_ROUTER = "0x7a250d5630b4cf539739df2c5dacab78c659f248"  # ETH
-PANCAKESWAP_ROUTER = "0x10ED43C718714eb63d5aA57B78B54704E256024E"  # BSC
+def fetch_market_price():
+    return round(random.uniform(1000, 3000), 2)
 
-web3_bsc = Web3(Web3.HTTPProvider(BSC_RPC))
-web3_eth = Web3(Web3.HTTPProvider(ETH_RPC))
+def execute_trade(decision, amount):
+    price = fetch_market_price()
+    result = round(random.uniform(-50, 150), 2)  # Simulated profit/loss
+    record_trade(decision, amount, price, result)
+    return {
+        "decision": decision,
+        "amount": amount,
+        "price": price,
+        "result": result
+    }
 
-def trade_token(token_address, chain="bsc"):
-    if TRADE_MODE == "mock":
-        return mock_trade(token_address, chain)
-    else:
-        return live_trade(token_address, chain)
+def auto_trade_loop():
+    while True:
+        decision = random.choice(["buy", "sell"])
+        amount = round(random.uniform(0.01, 0.1), 4)
+        trade_result = execute_trade(decision, amount)
+        print(f"Executed {decision.upper()} | Amount: {amount} | Price: {trade_result['price']} | Result: {trade_result['result']}")
+        time.sleep(60)  # Run every 60 seconds
 
-def mock_trade(token_address, chain):
-    profit = round(random.uniform(-0.1, 0.25), 4)  # Simulate loss/profit
-    outcome = "success" if profit > 0 else "fail"
-    from ai_brain import record_trade
-    record_trade(token_address, profit=profit, outcome=outcome, notes="mock")
-    return {"status": outcome, "profit": profit}
-
-def live_trade(token_address, chain):
-    # TODO: Integrate actual buy logic via router ABI
-    # This placeholder avoids real trades
-    return {"status": "not_implemented", "token": token_address}
-
-def get_wallet_address(chain):
-    return BSC_WALLET if chain == "bsc" else ETH_WALLET
-
-def get_web3(chain):
-    return web3_bsc if chain == "bsc" else web3_eth
+if __name__ == "__main__":
+    auto_trade_loop()
