@@ -1,20 +1,14 @@
 import requests
+import time
 
 def get_new_tokens():
-    url = "https://api.dexscreener.com/latest/dex/pairs/bsc"
+    url = "https://api.coingecko.com/api/v3/coins/list"
     try:
         response = requests.get(url)
-        data = response.json()
-        tokens = []
-        for item in data.get("pairs", []):
-            token = {
-                "name": item.get("baseToken", {}).get("name", "Unknown"),
-                "address": item.get("baseToken", {}).get("address", ""),
-                "liquidity": float(item.get("liquidity", {}).get("usd", 0)),
-                "creator_age_days": 7  # Placeholder value for now
-            }
-            tokens.append(token)
-        return tokens
-    except Exception as e:
-        print(f"Error in get_new_tokens: {e}")
+        response.raise_for_status()
+        coins = response.json()
+        print(f"[Scanner] Retrieved {len(coins)} tokens.")
+        return coins
+    except requests.RequestException as e:
+        print(f"[Scanner] Error fetching tokens: {e}")
         return []
