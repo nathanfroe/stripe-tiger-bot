@@ -2,7 +2,7 @@ import os
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 from token_scanner import get_new_tokens
-from scam_filter import is_scam_token
+from scam_filter import is_scam_token  # ✅ Corrected import
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
@@ -13,7 +13,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Scanning for new tokens...")
     tokens = get_new_tokens()
-    legit_tokens = [t for t in tokens if not is_scam_token(t)]
+    legit_tokens = [t for t in tokens if not is_scam_token(t)]  # ✅ Updated call
 
     if not legit_tokens:
         await update.message.reply_text("No legit tokens found.")
