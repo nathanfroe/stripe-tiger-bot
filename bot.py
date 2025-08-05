@@ -44,7 +44,7 @@ def run_bot():
         send_telegram_message(error_msg)
 
 # === Scheduler Setup ===
-schedule.every(15).minutes.do(run_bot)
+schedule.every(1).minutes.do(run_bot)
 
 # === Initial Startup ===
 send_telegram_message("✅ Stripe Tiger bot is live and hunting (logging mode enabled).")
