@@ -1,46 +1,37 @@
 import os
-import logging
-import time
-from telegram import Bot
-from scam_filter import is_legit_token
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 from token_scanner import get_new_tokens
+from scam_filter import is_scam_token
 
-# Logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-# Telegram setup
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-bot = Bot(token=TELEGRAM_TOKEN)
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Stripe Tiger bot is live and hunting.")
 
-def send_telegram_alert(message):
-    try:
-        bot.send_message(chat_id=CHAT_ID, text=message)
-        logger.info("Telegram alert sent.")
-    except Exception as e:
-        logger.error(f"Failed to send Telegram alert: {e}")
+async def scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Scanning for new tokens...")
+    tokens = get_new_tokens()
+    legit_tokens = [t for t in tokens if not is_scam_token(t)]
 
-def main_loop():
-    seen = set()
+    if not legit_tokens:
+        await update.message.reply_text("No legit tokens found.")
+    else:
+        for token in legit_tokens[:5]:  # Limit to top 5
+            msg = f"✅ Token: {token['name']}\n💧 Liquidity: ${token['liquidity']}\n🔗 Address: {token['address']}"
+            await update.message.reply_text(msg)
 
-    while True:
-        try:
-            tokens = get_new_tokens()
-            for token in tokens:
-                if token["address"] not in seen:
-                    seen.add(token["address"])
-                    logger.info(f"Token found: {token['name']} - {token['address']}")
-                    if is_legit_token(token):
-                        message = f"✅ Legit token detected:\nName: {token['name']}\nAddress: {token['address']}"
-                        send_telegram_alert(message)
-                    else:
-                        logger.info(f"❌ Scam token ignored: {token['name']}")
-            time.sleep(60)
-        except Exception as e:
-            logger.error(f"Main loop error: {e}")
-            time.sleep(30)
+def main():
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        raise EnvironmentError("Missing TELEGRAM_TOKEN or TELEGRAM_CHAT_ID.")
+
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("scan", scan))
+
+    app.run_polling()
 
 if __name__ == "__main__":
-    logger.info("Stripe Tiger Bot started.")
-    main_loop()
+    main()
