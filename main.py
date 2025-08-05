@@ -1,33 +1,46 @@
 import os
 import logging
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+import time
+from telegram import Bot
+from scam_filter import is_legit_token
+from token_scanner import get_new_tokens
 
-# Logging setup
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
+# Logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# Read Telegram Bot Token from Render environment variable
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+# Telegram setup
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+bot = Bot(token=TELEGRAM_TOKEN)
 
-if not TELEGRAM_TOKEN:
-    raise RuntimeError("TELEGRAM_TOKEN environment variable not found. Set it in Render dashboard.")
+def send_telegram_alert(message):
+    try:
+        bot.send_message(chat_id=CHAT_ID, text=message)
+        logger.info("Telegram alert sent.")
+    except Exception as e:
+        logger.error(f"Failed to send Telegram alert: {e}")
 
-# Basic /start command
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Hello! The Stripe Tiger Bot is running successfully!")
+def main_loop():
+    seen = set()
 
-# Entry point
-def main():
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-
-    # Register command handlers
-    app.add_handler(CommandHandler("start", start))
-
-    # Run the bot
-    app.run_polling()
+    while True:
+        try:
+            tokens = get_new_tokens()
+            for token in tokens:
+                if token["address"] not in seen:
+                    seen.add(token["address"])
+                    logger.info(f"Token found: {token['name']} - {token['address']}")
+                    if is_legit_token(token):
+                        message = f"✅ Legit token detected:\nName: {token['name']}\nAddress: {token['address']}"
+                        send_telegram_alert(message)
+                    else:
+                        logger.info(f"❌ Scam token ignored: {token['name']}")
+            time.sleep(60)
+        except Exception as e:
+            logger.error(f"Main loop error: {e}")
+            time.sleep(30)
 
 if __name__ == "__main__":
-    main()
+    logger.info("Stripe Tiger Bot started.")
+    main_loop()
