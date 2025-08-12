@@ -2,13 +2,13 @@ import os
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from logger import log_event, log_error
-from trading_engine import execute_trading_strategy
+from trade_engine import execute_trading_strategy  # matches your file name
 from ai_brain import retrain_model
 from data_source import get_price_volume_series
 
 # ===== Env =====
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # must be full URL, e.g. https://<service>.onrender.com/webhook
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # e.g. https://<service>.onrender.com/webhook
 TRADE_MODE = os.getenv("TRADE_MODE", "mock").lower()
 
 if not TOKEN:
@@ -76,7 +76,7 @@ async def trading_job(context: ContextTypes.DEFAULT_TYPE):
 def main():
     app = Application.builder().token(TOKEN).build()
 
-    # Command handlers
+    # Commands
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("retrain", retrain))
@@ -85,14 +85,12 @@ def main():
     # Run strategy every 60s (first run after 5s)
     app.job_queue.run_repeating(trading_job, interval=60, first=5)
 
-    # Webhook server — IMPORTANT:
-    # - url_path="" so we accept POSTs at "/" on the server
-    # - webhook_url must be the full public URL to your webhook endpoint (in env)
+    # Webhook server listens on /webhook (matches WEBHOOK_URL path)
     app.run_webhook(
         listen="0.0.0.0",
         port=int(os.getenv("PORT", 10000)),
-        url_path="",                 # accept at "/"
-        webhook_url=WEBHOOK_URL,     # e.g. https://<service>.onrender.com/webhook
+        url_path="webhook",
+        webhook_url=WEBHOOK_URL,
     )
 
 if __name__ == "__main__":
