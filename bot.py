@@ -1,97 +1,68 @@
 import os
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
-from logger import log_event, log_error
-from trade_engine import execute_trading_strategy  # matches your file name
-from ai_brain import retrain_model
-from data_source import get_price_volume_series
+import logging
+import requests
+from flask import Flask, request, jsonify
 
-# ===== Env =====
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # e.g. https://<service>.onrender.com/webhook
-TRADE_MODE = os.getenv("TRADE_MODE", "mock").lower()
-
+# -------------------------
+# Config
+# -------------------------
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 if not TOKEN:
-    raise RuntimeError("Missing TELEGRAM_BOT_TOKEN (or BOT_TOKEN).")
-if not WEBHOOK_URL:
-    raise RuntimeError("Missing WEBHOOK_URL (e.g. https://<service>.onrender.com/webhook).")
+    raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
 
-# ===== Commands =====
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        await update.message.reply_text(
-            "✅ Stripe Tiger bot online.\n"
-            f"Mode: {TRADE_MODE.upper()}\n"
-            "Commands: /status, /retrain, /mode mock|live"
-        )
-        user = update.effective_user.username or update.effective_user.id
-        log_event("User started bot", meta={"user": user})
-    except Exception as e:
-        log_error("start handler failed", meta={"error": str(e)})
+TG_API = f"https://api.telegram.org/bot{TOKEN}"
+# Optional: set this if you want Telegram to include a secret on webhook calls
+WEBHOOK_SECRET_TOKEN = os.getenv("WEBHOOK_SECRET_TOKEN", "").strip()
 
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# -------------------------
+# App
+# -------------------------
+app = Flask(__name__)
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("stripe-tiger-bot")
+
+def tg_send_message(chat_id: int, text: str):
     try:
-        symbol, prices, volumes = get_price_volume_series()
-        last_price = prices[-1] if prices else "N/A"
-        await update.message.reply_text(
-            f"📊 Tracking: {symbol}\n"
-            f"Latest price: {last_price}\n"
-            f"Data points: {len(prices)}"
+        requests.post(
+            f"{TG_API}/sendMessage",
+            json={"chat_id": chat_id, "text": text},
+            timeout=15,
         )
     except Exception as e:
-        log_error("status handler failed", meta={"error": str(e)})
-        await update.message.reply_text("⚠️ Unable to fetch status right now.")
+        log.exception("sendMessage failed: %s", e)
 
-async def retrain(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        retrain_model()
-        await update.message.reply_text("🧠 Model retrain triggered.")
-    except Exception as e:
-        log_error("retrain handler failed", meta={"error": str(e)})
-        await update.message.reply_text("⚠️ Retrain failed; check logs.")
+@app.get("/")
+def health():
+    return jsonify(status="ok")
 
-async def mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global TRADE_MODE
-    try:
-        if context.args and context.args[0].lower() in ["mock", "live"]:
-            TRADE_MODE = context.args[0].lower()
-            await update.message.reply_text(f"⚙️ Trade mode set to {TRADE_MODE.upper()}")
-            log_event("Trade mode updated", meta={"new_mode": TRADE_MODE})
+@app.post("/webhook")
+def telegram_webhook():
+    # Optional header check (only if you set WEBHOOK_SECRET_TOKEN with setWebhook)
+    if WEBHOOK_SECRET_TOKEN:
+        if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET_TOKEN:
+            return ("forbidden", 403)
+
+    update = request.get_json(silent=True) or {}
+    log.debug("update: %s", update)
+
+    # Basic message handler
+    msg = update.get("message") or update.get("edited_message")
+    if msg:
+        chat_id = msg["chat"]["id"]
+        text = (msg.get("text") or "").strip()
+
+        if text.lower().startswith("/start"):
+            tg_send_message(chat_id, "Stripe Tiger bot is live and hunting.")
+        elif text.lower().startswith("/help"):
+            tg_send_message(chat_id, "Commands: /start, /help")
         else:
-            await update.message.reply_text("Usage: /mode mock OR /mode live")
-    except Exception as e:
-        log_error("mode handler failed", meta={"error": str(e)})
-        await update.message.reply_text("⚠️ Could not update mode.")
+            # default echo or ignore
+            tg_send_message(chat_id, "Roger. 🐯")
 
-# ===== Scheduled trading job =====
-async def trading_job(context: ContextTypes.DEFAULT_TYPE):
-    try:
-        symbol, prices, volumes = get_price_volume_series()
-        if prices and volumes:
-            execute_trading_strategy(symbol, prices, volumes, TRADE_MODE)
-    except Exception as e:
-        log_error("trading_job failed", meta={"error": str(e)})
+    # (Optional) callback queries, etc., can be added here.
 
-# ===== Main =====
-def main():
-    app = Application.builder().token(TOKEN).build()
+    return jsonify(ok=True)
 
-    # Commands
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("status", status))
-    app.add_handler(CommandHandler("retrain", retrain))
-    app.add_handler(CommandHandler("mode", mode))
-
-    # Run strategy every 60s (first run after 5s)
-    app.job_queue.run_repeating(trading_job, interval=60, first=5)
-
-    # Webhook server listens on /webhook (matches WEBHOOK_URL path)
-    app.run_webhook(
-        listen="0.0.0.0",
-        port=int(os.getenv("PORT", 10000)),
-        url_path="webhook",
-        webhook_url=WEBHOOK_URL,
-    )
-
+# Local dev convenience
 if __name__ == "__main__":
-    main()
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
