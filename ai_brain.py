@@ -1,55 +1,76 @@
-import json
+import pandas as pd
+import numpy as np
+import joblib
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score
 import os
-import time
 
-BRAIN_FILE = "memory/ai_brain.json"
+MODEL_FILE = "ai_model.pkl"
 
-def load_brain():
-    if not os.path.exists(BRAIN_FILE):
-        return {}
-    with open(BRAIN_FILE, "r") as f:
-        return json.load(f)
+class AIBrain:
+    def __init__(self):
+        self.model = None
+        if os.path.exists(MODEL_FILE):
+            self.model = joblib.load(MODEL_FILE)
+            print("✅ AI Model loaded from file.")
+        else:
+            print("⚠️ No existing model found, will train a new one.")
 
-def save_brain(data):
-    with open(BRAIN_FILE, "w") as f:
-        json.dump(data, f, indent=2)
+    def train_model(self, data: pd.DataFrame):
+        """
+        Train model based on provided historical data.
+        Data must have features in X and binary outcome in y (0 = sell, 1 = buy)
+        """
+        if data.empty:
+            print("⚠️ No data provided for training.")
+            return
 
-def record_trade(token, profit, outcome, notes=""):
-    brain = load_brain()
-    if token not in brain:
-        brain[token] = {
-            "trades": [],
-            "success": 0,
-            "failure": 0,
-            "total_profit": 0
-        }
+        X = data.drop("target", axis=1)
+        y = data["target"]
 
-    trade = {
-        "timestamp": time.time(),
-        "profit": profit,
-        "outcome": outcome,
-        "notes": notes
-    }
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.2, random_state=42
+        )
 
-    brain[token]["trades"].append(trade)
-    brain[token]["total_profit"] += profit
+        self.model = RandomForestClassifier(n_estimators=100, random_state=42)
+        self.model.fit(X_train, y_train)
 
-    if outcome == "success":
-        brain[token]["success"] += 1
-    else:
-        brain[token]["failure"] += 1
+        preds = self.model.predict(X_test)
+        accuracy = accuracy_score(y_test, preds)
+        print(f"📊 Training completed. Accuracy: {accuracy:.2f}")
 
-    save_brain(brain)
+        joblib.dump(self.model, MODEL_FILE)
+        print("💾 Model saved.")
 
-def get_brain_summary():
-    brain = load_brain()
-    summary = {}
-    for token, data in brain.items():
-        total = data["success"] + data["failure"]
-        win_rate = (data["success"] / total) * 100 if total > 0 else 0
-        summary[token] = {
-            "win_rate": round(win_rate, 2),
-            "trades": len(data["trades"]),
-            "profit": data["total_profit"]
-        }
-    return summary
+    def predict(self, features: pd.DataFrame):
+        """
+        Predict buy/sell decision based on features.
+        Returns: 1 = buy, 0 = sell
+        """
+        if self.model is None:
+            print("⚠️ No trained model found. Train model first.")
+            return None
+
+        prediction = self.model.predict(features)
+        return prediction[0]
+
+# Example usage:
+if __name__ == "__main__":
+    brain = AIBrain()
+
+    # Simulated training example
+    dummy_data = pd.DataFrame({
+        "feature1": np.random.rand(100),
+        "feature2": np.random.rand(100),
+        "target": np.random.randint(0, 2, 100)
+    })
+
+    brain.train_model(dummy_data)
+
+    # Simulated prediction
+    test_features = pd.DataFrame({
+        "feature1": [0.45],
+        "feature2": [0.67]
+    })
+    print("Predicted Action:", brain.predict(test_features))
