@@ -1,8 +1,9 @@
-python-telegram-bot==20.3
-Flask==2.3.3
-gunicorn==21.2.0
-requests==2.31.0
-python-dotenv==1.0.0
-schedule==1.2.0
-# Uncomment ccxt after we confirm build is stable:
-# ccxt==4.0.22
+Flask
+python-dotenv
+gunicorn
+requests
+schedule
+pandas
+numpy
+python-telegram-bot
+httpx
