@@ -1,4 +1,3 @@
-# core web/bot deps
 Flask==3.0.2
 gunicorn==21.2.0
 python-dotenv==1.0.1
@@ -8,11 +7,11 @@ python-telegram-bot==20.6
 httpx==0.27.0
 python-binance==1.0.19
 
-# scientific stack - versions with cp311 manylinux wheels
+# wheels guaranteed for Python 3.11
 numpy==1.26.4
 pandas==2.1.4
 
-# ensure build backends are present if anything needs a wheel build
+# modern build tools (in case anything else needs a wheel)
 pip==24.2
 setuptools==70.0.0
 wheel==0.43.0
