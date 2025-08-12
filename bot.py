@@ -1,56 +1,32 @@
 import os
-import logging
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, ContextTypes
+from logger import log_event
+from trading_engine import execute_trading_strategy
+from ai_brain import retrain_model
+from data_source import get_price_volume_series
 
-logging.basicConfig(
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    level=logging.INFO,
-)
-log = logging.getLogger("stripe-tiger-bot")
+# Environment variables
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+ALERT_CHAT_ID = os.getenv("ALERT_CHAT_ID")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+TRADE_MODE = os.getenv("TRADE_MODE", "mock").lower()
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # e.g. https://<service>.onrender.com/webhook
-PORT = int(os.getenv("PORT", "10000"))
-
+# Commands
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Stripe Tiger bot is live and hunting.")
+    await update.message.reply_text(
+        "✅ Bot is online.\n"
+        f"Mode: {TRADE_MODE.upper()}\n"
+        "Use /status to check AI activity."
+    )
+    log_event("User started bot", meta={"user": update.effective_user.username})
 
-async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Mock buy executed.")
-
-async def sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Mock sell executed.")
-
-async def health(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("ok")
-
-async def on_start(app):
-    # Set webhook on startup (idempotent)
-    if WEBHOOK_URL:
-        await app.bot.set_webhook(url=WEBHOOK_URL)
-        log.info("Webhook set to %s", WEBHOOK_URL)
-    else:
-        log.error("WEBHOOK_URL not set; cannot receive updates.")
-
-def main():
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN not set")
-
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("buy", buy))
-    app.add_handler(CommandHandler("sell", sell))
-    app.add_handler(CommandHandler("health", health))
-
-    # IMPORTANT: webhook server only (no polling)
-    app.post_init = on_start
-    app.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        url_path="",   # PTB serves the webhook at '/' when using set_webhook with full URL
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    symbol, prices, volumes = get_price_volume_series()
+    await update.message.reply_text(
+        f"📊 Tracking {symbol}\n"
+        f"Latest price: ${prices[-1] if prices else 'N/A'}\n"
+        f"Data points: {len(prices)}"
     )
 
-if __name__ == "__main__":
-    main()# bot.p
+async def retrain(update: Update, context: ContextTypes.DEFAULT
