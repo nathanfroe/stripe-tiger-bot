@@ -1,17 +1,6 @@
-Flask==3.0.2
-gunicorn==21.2.0
-python-dotenv==1.0.1
-requests==2.31.0
-schedule==1.2.1
 python-telegram-bot==20.6
-httpx==0.27.0
-python-binance==1.0.19
-
-# wheels guaranteed for Python 3.11
+Flask==3.0.3
+gunicorn==21.2.0
+requests==2.31.0
+pandas==2.2.2
 numpy==1.26.4
-pandas==2.1.4
-
-# modern build tools (in case anything else needs a wheel)
-pip==24.2
-setuptools==70.0.0
-wheel==0.43.0
