@@ -1,6 +1,13 @@
-python-telegram-bot==20.6
-Flask==3.0.3
-gunicorn==21.2.0
-requests==2.31.0
-pandas==2.2.2
-numpy==1.26.4
+--only-binary=:all:
+-c constraints.txt
+
+Flask
+gunicorn
+python-dotenv
+requests
+schedule
+python-telegram-bot
+httpx
+python-binance
+numpy
+pandas
