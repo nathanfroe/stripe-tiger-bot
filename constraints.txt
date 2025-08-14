@@ -1,7 +1,12 @@
+# Pinned toolchain
 setuptools==69.5.1
 wheel==0.43.0
+
+# Binary wheels known-good on Python 3.12 Linux
 numpy==1.26.4
 pandas==2.2.2
+
+# App libraries
 python-binance==1.0.19
 python-telegram-bot==20.6
 requests==2.31.0
