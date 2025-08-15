@@ -1,4 +1,4 @@
-import os, json, time
+import os
 from datetime import datetime
 from flask import Flask, request, Response
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -131,6 +131,6 @@ def boot():
 # Run boot at import (works under gunicorn -w 1)
 boot()
 
-# Only needed when running directly (not under gunicorn)
+# Local dev path if ever needed
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=PORT)   
+    app.run(host="0.0.0.0", port=PORT)
