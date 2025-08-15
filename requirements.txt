@@ -1,12 +1,26 @@
 Flask==3.0.0
 gunicorn==21.2.0
-python-dotenv==1.0.1
-requests==2.31.0
-schedule==1.2.0
-
-# Trading/data libs (build cleanly on Python 3.13)
-numpy==2.1.3
-pandas==2.2.3
-
-# Optional: if you actually use it
+python-telegram-bot==13.15
 python-binance==1.0.19
+schedule==1.2.0
+pytz==2023.3
+websockets==12.0
+urllib3==1.26.18
+ujson==5.9.0
+tzlocal==5.1
+zdata==0.2.0
+six==1.16.0
+pycryptodome==3.20.0
+propcache==0.1.1
+packaging==23.2
+numpy==1.26.4
+multidict==6.0.4
+MarkupSafe==2.1.5
+itsdangerous==2.2.0
+idna==3.6
+frozenlist==1.4.1
+yarl==1.9.4
+Werkzeug==3.0.1
+requests==2.31.0
+python-dateutil==2.9.0.post0
+aiohttp==3.9.3
