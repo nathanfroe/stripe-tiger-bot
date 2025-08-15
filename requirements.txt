@@ -9,3 +9,4 @@ ujson==5.9.0
 tzlocal==5.1
 requests==2.31.0
 numpy==1.26.4
+python-dotenv==1.0.1
