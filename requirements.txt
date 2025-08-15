@@ -1,27 +1,31 @@
---only-binary=:all:
-
-Flask==3.0.3
+flask==3.0.3
 gunicorn==22.0.0
 requests==2.32.3
-web3==6.19.0
-APScheduler==3.10.4
-tenacity==8.4.1
+python-dotenv==1.0.1
 loguru==0.7.2
 
-# Analysis / ML / indicators (not strictly required for run, but kept for full scope)
+# Telegram
+python-telegram-bot==20.6
+
+# Scheduling, retries, jobs
+APScheduler==3.10.4
+tenacity==8.5.0
+
+# On-chain trading
+web3==6.20.1
+
+# Indicators / quant / ML
 numpy==1.26.4
 pandas==2.2.2
-scikit-learn==1.5.1
-joblib==1.4.2
-tabulate==0.9.0
+scipy==1.11.4
+scikit-learn==1.4.2
+statsmodels==0.14.2
+TA-Lib==0.4.28
 
-# Async / networking extras (future expansion, safe today)
-aiohttp==3.9.5
-websockets==12.0
+# Market data & backtesting (optional but powerful)
+yfinance==0.2.43
+backtrader==1.9.78.123
 
-# Optional exchange integrations (safe to keep installed)
-ccxt==4.3.48
-python-binance==1.0.19
-
-# Crypto helpers
-cryptography==42.0.7
+# Optional CEX (only add if you really want CEX trading as well)
+# ccxt==4.3.82
+# python-binance==1.0.19
