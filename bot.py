@@ -44,7 +44,6 @@ def tg_send(chat_id: str, text: str):
         logger.exception("Telegram send error: %s", e)
 
 # ===== ENGINE =====
-# Keep your actual module/file name: trademachine.py -> TradeMachine
 from trademachine import TradeMachine
 
 # *** FIX: pass tg_sender required by TradeMachine.__init__ ***
@@ -74,7 +73,6 @@ def heartbeat():
 
 def trading_cycle():
     try:
-        # Keep original call — guard so engine errors don’t crash the service
         if hasattr(engine, "run_cycle"):
             engine.run_cycle()
         elif hasattr(engine, "run"):
@@ -92,16 +90,12 @@ def keepalive():
         requests.get(f"{SELF_URL}/healthz", timeout=8)
         logger.info("Keepalive ping OK")
     except Exception:
-        # Not noisy; keep logs clean
         pass
 
 def start_jobs():
-    # Heartbeat
     sched.add_job(heartbeat, "interval", seconds=HEARTBEAT_SEC, id="heartbeat", replace_existing=True)
-    # Trading loop (respect engine.poll_seconds if provided)
     poll_secs = getattr(engine, "poll_seconds", 60)
     sched.add_job(trading_cycle, "interval", seconds=poll_secs, id="trading_cycle", replace_existing=True)
-    # Keep the service warm (optional; requires SELF_URL)
     if SELF_URL:
         sched.add_job(keepalive, "interval", seconds=300, id="keepalive", replace_existing=True)
 
@@ -145,9 +139,34 @@ def root():
 def healthz():
     return Response("healthy", status=200)
 
+# --- ADD: self-test endpoint to simulate Telegram POST quickly ---
+@app.route("/__selftest", methods=["POST"])
+def __selftest():
+    """POST JSON: {"chat_id": "<id>", "text": "/ping"} to test handler end-to-end on Render."""
+    data = request.get_json(silent=True) or {}
+    fake = {
+        "message": {
+            "chat": {"id": data.get("chat_id", ADMIN_CHAT_ID)},
+            "text": data.get("text", "/ping")
+        }
+    }
+    with app.test_request_context("/webhook", method="POST", json=fake):
+        return webhook()
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
+    # --- ADD: log headers + compact payload so we can see hits in Render logs
+    try:
+        logger.info("Webhook headers: %s", dict(request.headers))
+    except Exception:
+        pass
+
     update = request.get_json(silent=True) or {}
+    try:
+        logger.info("Webhook payload keys: %s", list(update.keys()))
+    except Exception:
+        pass
+
     msg = update.get("message") or update.get("edited_message") or {}
     text = (msg.get("text") or "").strip()
     chat_id = str((msg.get("chat") or {}).get("id") or "") or ADMIN_CHAT_ID
@@ -159,7 +178,6 @@ def webhook():
 
     low = text.lower()
 
-    # Commands — preserve original set, add guards so engine issues don’t crash
     if low.startswith("/start"):
         tg_send(chat_id, "🐯 Stripe Tiger bot is live.")
         return Response("ok", status=200)
@@ -245,7 +263,6 @@ def webhook():
         tg_send(chat_id, "pong")
         return Response("ok", status=200)
 
-    # default
     tg_send(
         chat_id,
         "Commands: /start /status /mode mock|live /pause /resume /buy <token> /sell <token> /ping"
@@ -259,6 +276,12 @@ def boot():
     except Exception as e:
         logger.warning("Webhook not set: %s", e)
     start_jobs()
+    # Boot ping proves our token can send
+    try:
+        if ADMIN_CHAT_ID:
+            tg_send(ADMIN_CHAT_ID, "✅ Boot OK (service live)")
+    except Exception:
+        pass
     if AUTO_START:
         try:
             if hasattr(engine, "resume"):
