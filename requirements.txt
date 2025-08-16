@@ -5,7 +5,7 @@ gunicorn==21.2.0
 python-telegram-bot==13.15
 
 # Scheduling / time
-APScheduler==3.10.4
+APScheduler==3.6.3
 tzlocal==5.2
 pytz==2024.1
 
