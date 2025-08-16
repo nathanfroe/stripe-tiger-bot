@@ -29,11 +29,10 @@ logging.basicConfig(
 logger = logging.getLogger("bot")
 
 # ===== ENGINE =====
-# FIXED: match your actual module filename (trademachine.py)
 from trademachine import TradeMachine
 engine = TradeMachine()
 
-# We inject the Telegram sender into the engine after defining it below
+# Telegram sender
 def tg_send(chat_id: str, text: str):
     if not TOKEN or not chat_id:
         return
@@ -48,12 +47,11 @@ def tg_send(chat_id: str, text: str):
     except Exception as e:
         logger.exception("Telegram send error: %s", e)
 
-# If your TradeMachine accepts a sender callback:
+# Attach Telegram sender to TradeMachine
 try:
     if hasattr(engine, "set_sender"):
         engine.set_sender(tg_send)
     else:
-        # fallback if engine expects attribute
         setattr(engine, "tg_sender", tg_send)
 except Exception as e:
     logger.warning("Could not attach Telegram sender to engine: %s", e)
@@ -73,7 +71,6 @@ def heartbeat():
 
 def trading_cycle():
     try:
-        # Keep original call — guard so engine errors don’t crash the service
         if hasattr(engine, "run_cycle"):
             engine.run_cycle()
         elif hasattr(engine, "run"):
@@ -91,19 +88,14 @@ def keepalive():
         requests.get(f"{SELF_URL}/healthz", timeout=8)
         logger.info("Keepalive ping OK")
     except Exception:
-        # Not noisy; keep logs clean
         pass
 
 def start_jobs():
-    # Heartbeat
     sched.add_job(heartbeat, "interval", seconds=HEARTBEAT_SEC, id="heartbeat", replace_existing=True)
-    # Trading loop (respect engine.poll_seconds if provided)
     poll_secs = getattr(engine, "poll_seconds", 60)
     sched.add_job(trading_cycle, "interval", seconds=poll_secs, id="trading_cycle", replace_existing=True)
-    # Keep the service warm (optional; requires SELF_URL)
     if SELF_URL:
         sched.add_job(keepalive, "interval", seconds=300, id="keepalive", replace_existing=True)
-
     if not sched.running:
         sched.start()
     logger.info("Scheduler started.")
@@ -158,7 +150,6 @@ def webhook():
 
     low = text.lower()
 
-    # Commands — preserve original set, add guards so engine issues don’t crash
     if low.startswith("/start"):
         tg_send(chat_id, "🐯 Stripe Tiger bot is live.")
         return Response("ok", status=200)
@@ -244,7 +235,6 @@ def webhook():
         tg_send(chat_id, "pong")
         return Response("ok", status=200)
 
-    # default
     tg_send(
         chat_id,
         "Commands: /start /status /mode mock|live /pause /resume /buy <token> /sell <token> /ping"
@@ -265,8 +255,7 @@ def boot():
         except Exception as e:
             logger.warning("Auto resume failed: %s", e)
 
-# Run boot at import (works under gunicorn -w 1)
 boot()
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=PORT)        
+    app.run(host="0.0.0.0", port=PORT)
