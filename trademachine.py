@@ -41,6 +41,7 @@ SMA_FAST = int(os.getenv("SMA_FAST", "20"))
 SMA_SLOW = int(os.getenv("SMA_SLOW", "50"))
 
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") or os.getenv("ADMIN_CHAT_ID")
+ALERT_CHAT_ID = os.getenv("ALERT_CHAT_ID") or TELEGRAM_CHAT_ID  # added: fallback if provided
 
 # Auto-tune controls
 AUTO_TUNE = os.getenv("AUTO_TUNE", "true").lower() == "true"
@@ -190,6 +191,10 @@ class TradeMachine:
         # cycle counter
         self._cycle = 0
 
+        # ====== ADDED: optional hooks ======
+        self.log_event_cb = None  # bot.py may set: engine.log_event_cb = log_event
+        self._alert_chat_id = ALERT_CHAT_ID or TELEGRAM_CHAT_ID
+
         logger.info(f"Engine init | mode={self.mode} poll={self.poll_seconds}s | autotune={AUTO_TUNE}")
 
     # ----- controls -----
@@ -227,6 +232,29 @@ class TradeMachine:
         for token in list(self.tuned_rsi_buy.keys()):
             yield (token, (round(self.tuned_rsi_buy[token],1), round(self.tuned_rsi_sell[token],1)))
 
+    # ====== ADDED: simple accessor ======
+    def get_positions(self):
+        """Return positions as a list of dicts for chat/debug/dashboard."""
+        out = []
+        for token, pos in (self.positions or {}).items():
+            out.append({
+                "token": token,
+                "qty": getattr(pos, "qty", 0.0),
+                "avg_price": getattr(pos, "avg", None),
+                "chain": getattr(pos, "chain", ""),
+            })
+        return out
+
+    # ====== ADDED: event recorder hook ======
+    def _record(self, kind: str, **kw):
+        """If a callback is attached (via bot.py), write structured events; otherwise no-op."""
+        try:
+            cb = getattr(self, "log_event_cb", None)
+            if callable(cb):
+                cb(kind, **kw)
+        except Exception:
+            pass
+
     # ----- manual commands (token is a 0x address) -----
     def manual_buy(self, token: str) -> str:
         chain = self._infer_chain(token)
@@ -254,9 +282,11 @@ class TradeMachine:
                 price, liq = _best_dexscreener_pair_usd(token, chain)
                 if price is None or liq is None:
                     self._notify(f"⚠️ No price/liquidity for {token} on {chain}")
+                    self._record("warn", token=token, chain=chain, note="no price/liquidity")
                     continue
                 if liq < MIN_LIQ_USD:
                     self._notify(f"❌ Liquidity ${liq:,.0f} < min ${MIN_LIQ_USD:,.0f} for {token} on {chain}")
+                    self._record("warn", token=token, chain=chain, liq=liq, note="low liq")
                     continue
 
                 # 2) Update indicators
@@ -291,13 +321,18 @@ class TradeMachine:
                     if want_buy:
                         res = self._execute(chain, "buy", token, ALLOCATION_USD)
                         self._notify(f"🟢 BUY {token} {chain} | p=${price:.6f} | SMA {SMA_FAST}/{SMA_SLOW}={s_fast:.6f}/{s_slow:.6f} | RSI={rsi:.2f}≥{rsi_b:.2f} | AI={ai_p:.2f}≥{ai_buy:.2f}\n{res}")
+                        self._record("signal", token=token, chain=chain, side="buy", price=price,
+                                     rsi=rsi, ai=ai_p, s_fast=s_fast, s_slow=s_slow)
                     elif want_sell:
                         res = self._execute(chain, "sell", token, ALLOCATION_USD)
                         self._notify(f"🔴 SELL {token} {chain} | p=${price:.6f} | SMA {SMA_FAST}/{SMA_SLOW}={s_fast:.6f}/{s_slow:.6f} | RSI={rsi:.2f}≤{rsi_s:.2f} | AI={ai_p:.2f}≤{ai_sell:.2f}\n{res}")
+                        self._record("signal", token=token, chain=chain, side="sell", price=price,
+                                     rsi=rsi, ai=ai_p, s_fast=s_fast, s_slow=s_slow)
 
             except Exception as e:
                 logger.exception("cycle error")
                 self._notify(f"⚠️ Cycle error {chain}:{token}: {e}")
+                self._record("error", token=token, chain=chain, note=f"cycle error: {e}")
 
     # ----- auto-tune -----
     def _maybe_autotune(self, token: str):
@@ -353,12 +388,21 @@ class TradeMachine:
             price, _ = _best_dexscreener_pair_usd(token_addr, chain)
             if not price:
                 return "[MOCK] no price"
+
+            # record submit (mock)
+            self._record("order_submitted", token=token_addr, chain=chain, side=side, price=price, usd=usd_amount, tx=None)
+
             pos = self.positions.get(token_addr, Position(qty=0.0, avg=0.0, chain=chain))
             if side == "buy":
                 units = usd_amount / price
                 new_qty = pos.qty + units
                 pos.avg = (pos.avg * pos.qty + usd_amount) / new_qty if new_qty > 0 else price
                 pos.qty = new_qty
+                self.positions[token_addr] = pos
+
+                # record fill (mock)
+                self._record("fill", token=token_addr, chain=chain, side="buy", qty=units, price=price, tx=None)
+
             else:
                 if pos.qty <= 0:
                     return "[MOCK] no position to sell"
@@ -367,7 +411,11 @@ class TradeMachine:
                 pos.qty -= units
                 if pos.qty == 0:
                     pos.avg = 0.0
-            self.positions[token_addr] = pos
+                self.positions[token_addr] = pos
+
+                # record fill (mock)
+                self._record("fill", token=token_addr, chain=chain, side="sell", qty=units, price=price, tx=None)
+
             return f"[MOCK] {side.upper()} {token_addr} on {chain} for ~${usd_amount:.2f} | pos={pos.qty:.6f}@{pos.avg:.6f} | PnL≈${self.pnl_usd:.2f}"
 
         # LIVE mode
@@ -384,16 +432,38 @@ class TradeMachine:
                 txh = self.dex.buy(chain, token_addr, base_to_spend)
             else:
                 txh = self.dex.sell(chain, token_addr, usd_amount)
+
+            # record submit (live)
+            self._record("order_submitted", token=token_addr, chain=chain, side=side, price=base_price, usd=usd_amount, tx=txh)
+            self._notify(f"📝 LIVE {side.upper()} {token_addr} ({chain}) tx={txh}")
+
+            # If you later detect confirmation, also call:
+            # self._record("fill", token=token_addr, chain=chain, side=side, price=fill_price, tx=txh)
+
             return f"[LIVE] {side.upper()} {token_addr} on {chain} ~${usd_amount:.2f} | tx={txh}"
         except Exception as e:
             logger.exception("live exec failed")
+            self._record("error", token=token_addr, chain=chain, side=side, note=f"live exec failed: {e}")
             return f"⚠️ live exec failed: {e}"
 
     # ----- utilities -----
     def _notify(self, text: str):
+        """
+        Prefer the injected tg_sender (from bot.py). If not present, fall back to
+        the original direct HTTP send using TELEGRAM_BOT_TOKEN and chat id.
+        """
+        # Preferred: callback
+        try:
+            target = self._alert_chat_id or TELEGRAM_CHAT_ID
+            if getattr(self, "tg", None) and target:
+                self.tg(target, text)
+                return
+        except Exception:
+            pass
+
+        # Fallback: direct HTTP
         if TELEGRAM_CHAT_ID:
             try:
-                import requests
                 token = os.getenv("TELEGRAM_BOT_TOKEN")
                 requests.post(
                     f"https://api.telegram.org/bot{token}/sendMessage",
