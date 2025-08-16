@@ -1,7 +1,7 @@
 Flask==3.0.3
 gunicorn==21.2.0
 
-# Telegram bot
+# Telegram bot (v13 works with APScheduler 3.6.x)
 python-telegram-bot==13.15
 
 # Scheduling / time
@@ -26,3 +26,7 @@ pandas==2.2.3
 scipy==1.11.4
 scikit-learn==1.4.2
 joblib==1.4.2
+
+# Logging & retries (address "No module named 'tenacity'")
+loguru==0.7.2
+tenacity==8.2.3
