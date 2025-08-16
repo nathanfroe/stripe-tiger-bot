@@ -1,8 +1,7 @@
-# bot.py  — full version (webhook + scheduler + keepalive + rich logging)
+# bot.py — full version (webhook + APScheduler + keepalive + robust logging)
 
 import os
 import json
-import time
 import logging
 from datetime import datetime, timezone as dt_tz
 
@@ -15,11 +14,11 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 TOKEN            = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ADMIN_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID") or os.getenv("ADMIN_CHAT_ID", "")
 ALERT_CHAT_ID    = os.getenv("ALERT_CHAT_ID", ADMIN_CHAT_ID)
-WEBHOOK_URL      = os.getenv("WEBHOOK_URL", "")  # ex: https://stripe-tiger-bot.onrender.com/webhook
+WEBHOOK_URL      = os.getenv("WEBHOOK_URL", "")       # e.g. https://stripe-tiger-bot.onrender.com/webhook
 HEARTBEAT_SEC    = int(os.getenv("HEARTBEAT_INTERVAL", "900"))
 AUTO_START       = os.getenv("AUTO_START", "true").lower() == "true"
 PORT             = int(os.getenv("PORT", "10000"))
-SELF_URL         = os.getenv("SELF_URL", "")      # ex: https://stripe-tiger-bot.onrender.com
+SELF_URL         = os.getenv("SELF_URL", "")          # e.g. https://stripe-tiger-bot.onrender.com
 TZ_NAME          = os.getenv("TIMEZONE", "UTC")
 
 # ===== LOGGING =====
@@ -30,11 +29,11 @@ logging.basicConfig(
 logger = logging.getLogger("bot")
 
 # ===== ENGINE =====
-# keep your import as you had it
-from trade_machine import TradeMachine
-engine = TradeMachine(tg_sender=None)  # we'll inject tg_send after def
+# FIXED: match your actual module filename (trademachine.py)
+from trademachine import TradeMachine
+engine = TradeMachine()
 
-# ----- Telegram send helper -----
+# We inject the Telegram sender into the engine after defining it below
 def tg_send(chat_id: str, text: str):
     if not TOKEN or not chat_id:
         return
@@ -49,10 +48,17 @@ def tg_send(chat_id: str, text: str):
     except Exception as e:
         logger.exception("Telegram send error: %s", e)
 
-# inject so engine can notify through Telegram if it wants
-engine.tg_sender = tg_send
+# If your TradeMachine accepts a sender callback:
+try:
+    if hasattr(engine, "set_sender"):
+        engine.set_sender(tg_send)
+    else:
+        # fallback if engine expects attribute
+        setattr(engine, "tg_sender", tg_send)
+except Exception as e:
+    logger.warning("Could not attach Telegram sender to engine: %s", e)
 
-# ===== FLASK =====
+# ===== FLASK APP =====
 app = Flask(__name__)
 
 # ===== SCHEDULER =====
@@ -60,11 +66,20 @@ sched = BackgroundScheduler(timezone=TZ_NAME)
 
 def heartbeat():
     ts = datetime.now(dt_tz.utc).isoformat(timespec="seconds")
-    tg_send(ALERT_CHAT_ID, f"❤️ heartbeat {ts}")
+    try:
+        tg_send(ALERT_CHAT_ID, f"❤️ heartbeat {ts}")
+    except Exception as e:
+        logger.warning("Heartbeat send failed: %s", e)
 
 def trading_cycle():
     try:
-        engine.run_cycle()
+        # Keep original call — guard so engine errors don’t crash the service
+        if hasattr(engine, "run_cycle"):
+            engine.run_cycle()
+        elif hasattr(engine, "run"):
+            engine.run()
+        else:
+            tg_send(ALERT_CHAT_ID, "⚠️ Engine has no run/run_cycle method.")
     except Exception as e:
         logger.exception("Cycle error")
         tg_send(ALERT_CHAT_ID, f"⚠️ Cycle error: {e}")
@@ -74,21 +89,26 @@ def keepalive():
         return
     try:
         requests.get(f"{SELF_URL}/healthz", timeout=8)
+        logger.info("Keepalive ping OK")
     except Exception:
-        # don’t spam logs unless it persists
+        # Not noisy; keep logs clean
         pass
 
 def start_jobs():
-    # schedule heartbeat & trading loop
+    # Heartbeat
     sched.add_job(heartbeat, "interval", seconds=HEARTBEAT_SEC, id="heartbeat", replace_existing=True)
-    sched.add_job(trading_cycle, "interval", seconds=engine.poll_seconds, id="trading_cycle", replace_existing=True)
-    # light keepalive ping every 5 minutes (optional)
-    sched.add_job(keepalive, "interval", seconds=300, id="keepalive", replace_existing=True)
+    # Trading loop (respect engine.poll_seconds if provided)
+    poll_secs = getattr(engine, "poll_seconds", 60)
+    sched.add_job(trading_cycle, "interval", seconds=poll_secs, id="trading_cycle", replace_existing=True)
+    # Keep the service warm (optional; requires SELF_URL)
+    if SELF_URL:
+        sched.add_job(keepalive, "interval", seconds=300, id="keepalive", replace_existing=True)
+
     if not sched.running:
         sched.start()
     logger.info("Scheduler started.")
 
-# ===== Webhook management =====
+# ===== WEBHOOK MGMT =====
 def _get_wh_info():
     try:
         r = requests.get(f"https://api.telegram.org/bot{TOKEN}/getWebhookInfo", timeout=10)
@@ -101,10 +121,13 @@ def ensure_webhook():
     if not TOKEN or not WEBHOOK_URL:
         logger.warning("TOKEN or WEBHOOK_URL missing; skipping setWebhook.")
         return
-    # Set webhook
     r = requests.get(
         f"https://api.telegram.org/bot{TOKEN}/setWebhook",
-        params={"url": WEBHOOK_URL, "drop_pending_updates": True, "allowed_updates": json.dumps(["message","edited_message"])},
+        params={
+            "url": WEBHOOK_URL,
+            "drop_pending_updates": True,
+            "allowed_updates": json.dumps(["message", "edited_message"])
+        },
         timeout=15,
     )
     if r.status_code != 200:
@@ -125,8 +148,8 @@ def healthz():
 def webhook():
     update = request.get_json(silent=True) or {}
     msg = update.get("message") or update.get("edited_message") or {}
-    text: str = (msg.get("text") or "").strip()
-    chat_id = str(msg.get("chat", {}).get("id") or "") or ADMIN_CHAT_ID
+    text = (msg.get("text") or "").strip()
+    chat_id = str((msg.get("chat") or {}).get("id") or "") or ADMIN_CHAT_ID
 
     logger.info("Update: chat=%s | text=%r", chat_id, text)
 
@@ -135,44 +158,86 @@ def webhook():
 
     low = text.lower()
 
-    # ---- commands ----
+    # Commands — preserve original set, add guards so engine issues don’t crash
     if low.startswith("/start"):
-        tg_send(chat_id, "🐯 Stripe Tiger bot is live and hunting.")
+        tg_send(chat_id, "🐯 Stripe Tiger bot is live.")
         return Response("ok", status=200)
 
     if low.startswith("/status"):
-        tg_send(chat_id, engine.status_text())
+        try:
+            if hasattr(engine, "status_text"):
+                tg_send(chat_id, engine.status_text())
+            else:
+                tg_send(chat_id, "status_text() not implemented in engine.")
+        except Exception as e:
+            logger.exception("status")
+            tg_send(chat_id, f"Status error: {e}")
         return Response("ok", status=200)
 
     if low.startswith("/mode"):
-        parts = low.split()
-        if len(parts) == 2 and parts[1] in ("mock", "live"):
-            engine.set_mode(parts[1])
-            tg_send(chat_id, f"Mode set to {parts[1]}")
-        else:
-            tg_send(chat_id, "Usage: /mode mock|live")
+        try:
+            parts = low.split()
+            if len(parts) == 2 and parts[1] in ("mock", "live"):
+                if hasattr(engine, "set_mode"):
+                    engine.set_mode(parts[1])
+                    tg_send(chat_id, f"Mode set to {parts[1]}")
+                else:
+                    tg_send(chat_id, "set_mode() not implemented in engine.")
+            else:
+                tg_send(chat_id, "Usage: /mode mock|live")
+        except Exception as e:
+            logger.exception("mode")
+            tg_send(chat_id, f"Mode error: {e}")
         return Response("ok", status=200)
 
     if low.startswith("/pause"):
-        engine.pause()
-        tg_send(chat_id, "Engine paused")
+        try:
+            if hasattr(engine, "pause"):
+                engine.pause()
+                tg_send(chat_id, "Engine paused")
+            else:
+                tg_send(chat_id, "pause() not implemented in engine.")
+        except Exception as e:
+            logger.exception("pause")
+            tg_send(chat_id, f"Pause error: {e}")
         return Response("ok", status=200)
 
     if low.startswith("/resume"):
-        engine.resume()
-        tg_send(chat_id, "Engine resumed")
+        try:
+            if hasattr(engine, "resume"):
+                engine.resume()
+                tg_send(chat_id, "Engine resumed")
+            else:
+                tg_send(chat_id, "resume() not implemented in engine.")
+        except Exception as e:
+            logger.exception("resume")
+            tg_send(chat_id, f"Resume error: {e}")
         return Response("ok", status=200)
 
     if low.startswith("/buy"):
         token = text.split(" ", 1)[1].strip() if " " in text else ""
-        res = engine.manual_buy(token)
-        tg_send(chat_id, res or "Buy attempted.")
+        try:
+            if hasattr(engine, "manual_buy"):
+                res = engine.manual_buy(token)
+                tg_send(chat_id, res or "Buy attempted.")
+            else:
+                tg_send(chat_id, "manual_buy() not implemented in engine.")
+        except Exception as e:
+            logger.exception("buy")
+            tg_send(chat_id, f"Buy error: {e}")
         return Response("ok", status=200)
 
     if low.startswith("/sell"):
         token = text.split(" ", 1)[1].strip() if " " in text else ""
-        res = engine.manual_sell(token)
-        tg_send(chat_id, res or "Sell attempted.")
+        try:
+            if hasattr(engine, "manual_sell"):
+                res = engine.manual_sell(token)
+                tg_send(chat_id, res or "Sell attempted.")
+            else:
+                tg_send(chat_id, "manual_sell() not implemented in engine.")
+        except Exception as e:
+            logger.exception("sell")
+            tg_send(chat_id, f"Sell error: {e}")
         return Response("ok", status=200)
 
     if low.startswith("/ping"):
@@ -180,7 +245,10 @@ def webhook():
         return Response("ok", status=200)
 
     # default
-    tg_send(chat_id, "Commands: /start /status /mode mock|live /pause /resume /buy <token> /sell <token> /ping")
+    tg_send(
+        chat_id,
+        "Commands: /start /status /mode mock|live /pause /resume /buy <token> /sell <token> /ping"
+    )
     return Response("ok", status=200)
 
 # ===== BOOT =====
@@ -191,11 +259,14 @@ def boot():
         logger.warning("Webhook not set: %s", e)
     start_jobs()
     if AUTO_START:
-        engine.resume()
+        try:
+            if hasattr(engine, "resume"):
+                engine.resume()
+        except Exception as e:
+            logger.warning("Auto resume failed: %s", e)
 
-# run once on import (works under gunicorn -w 1)
+# Run boot at import (works under gunicorn -w 1)
 boot()
 
 if __name__ == "__main__":
-    # local run
     app.run(host="0.0.0.0", port=PORT)        
