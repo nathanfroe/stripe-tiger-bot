@@ -1,12 +1,15 @@
+# bot.py
 import os
+import logging
 from datetime import datetime
 from flask import Flask, request, Response
 from apscheduler.schedulers.background import BackgroundScheduler
 from tenacity import retry, stop_after_attempt, wait_exponential
-from loguru import logger
 import requests
 
-from trademachine import TradeMachine  # ✅ fixed import
+# NOTE: fix was here: import from 'trademachine' (file name) not 'trade_machine'
+from trademachine import TradeMachine
+
 
 # ===== ENV =====
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -18,43 +21,54 @@ AUTO_START = os.getenv("AUTO_START", "true").lower() == "true"
 PORT = int(os.getenv("PORT", "10000"))
 
 # ===== LOGGING =====
-logger.remove()
-logger.add(lambda m: print(m, end=""), level="INFO",
-           format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}")
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+logger = logging.getLogger("bot")
+
 
 # ===== TELEGRAM =====
 def tg_send(chat_id: str, text: str):
+    """Send a Telegram message; swallow errors but log them."""
     if not TOKEN or not chat_id:
         return
     try:
         requests.post(
             f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-            json={"chat_id": chat_id, "text": text},
+            json={"chat_id": chat_id, "text": text, "parse_mode": os.getenv("TELEGRAM_PARSE_MODE", "Markdown")},
             timeout=10,
         )
     except Exception as e:
         logger.error(f"Telegram send error: {e}")
 
-@retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, max=60))
+
+@retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=2, max=30))
 def ensure_webhook():
+    """Idempotently set the Telegram webhook (retries on transient errors)."""
     if not TOKEN or not WEBHOOK_URL:
-        logger.warning("TOKEN or WEBHOOK_URL missing; skipping setWebhook")
+        logger.warning("TOKEN or WEBHOOK_URL missing; skipping setWebhook.")
         return
     r = requests.get(
         f"https://api.telegram.org/bot{TOKEN}/setWebhook",
         params={"url": WEBHOOK_URL},
+        timeout=15,
     )
     if r.status_code != 200:
         raise RuntimeError(f"setWebhook failed: {r.text}")
     logger.info("Webhook set OK.")
 
+
 # ===== APP / ENGINE / SCHED =====
 app = Flask(__name__)
 engine = TradeMachine(tg_sender=tg_send)
+
 sched = BackgroundScheduler(timezone=os.getenv("TIMEZONE", "UTC"))
 
+
 def heartbeat():
-    tg_send(ALERT_CHAT_ID, f"⏱ {datetime.utcnow().isoformat(timespec='seconds')} UTC heartbeat OK.")
+    tg_send(ALERT_CHAT_ID, f"🫀 {datetime.utcnow().isoformat(timespec='seconds')} UTC | alive")
+
 
 def trading_cycle():
     try:
@@ -63,39 +77,46 @@ def trading_cycle():
         logger.exception("cycle")
         tg_send(ALERT_CHAT_ID, f"⚠️ Cycle error: {e}")
 
+
 def start_scheduled_jobs():
-    sched.add_job(heartbeat, "interval", seconds=HEARTBEAT_INTERVAL, id="heartbeat")
-    sched.add_job(trading_cycle, "interval", seconds=engine.poll_seconds, id="trading_loop")
+    # heartbeat
+    sched.add_job(heartbeat, "interval", seconds=HEARTBEAT_INTERVAL, id="heartbeat", replace_existing=True)
+    # trading loop
+    sched.add_job(trading_cycle, "interval", seconds=engine.poll_seconds, id="trading_cycle", replace_existing=True)
     sched.start()
     logger.info("Scheduler started.")
+
 
 # ===== ROUTES =====
 @app.route("/", methods=["GET"])
 def root():
     return Response("OK", status=200)
 
+
 @app.route("/healthz", methods=["GET"])
 def healthz():
     return Response("healthy", status=200)
+
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
     update = request.get_json(silent=True) or {}
     msg = update.get("message") or update.get("edited_message") or {}
     text = (msg.get("text") or "").strip()
-    chat_id = str(msg.get("chat", {}).get("id", ""))
+    chat_id = str((msg.get("chat") or {}).get("id", ""))
 
     if not text:
         return Response("no-text", status=200)
 
     low = text.lower()
+
     if low == "/status":
         tg_send(chat_id or ADMIN_CHAT_ID, engine.status_text())
     elif low.startswith("/mode"):
         parts = low.split()
         if len(parts) == 2 and parts[1] in ("mock", "live"):
             engine.set_mode(parts[1])
-            tg_send(chat_id or ADMIN_CHAT_ID, f"Mode set to {parts[1]}")
+            tg_send(chat_id or ADMIN_CHAT_ID, f"Mode set to **{parts[1]}**")
         else:
             tg_send(chat_id or ADMIN_CHAT_ID, "Usage: /mode mock|live")
     elif low == "/pause":
@@ -105,17 +126,26 @@ def webhook():
         engine.resume()
         tg_send(chat_id or ADMIN_CHAT_ID, "Engine resumed")
     elif low.startswith("/buy "):
-        token = text.split()[1]
+        token = text.split(maxsplit=1)[1].strip()
         res = engine.manual_buy(token)
         tg_send(chat_id or ADMIN_CHAT_ID, res)
     elif low.startswith("/sell "):
-        token = text.split()[1]
+        token = text.split(maxsplit=1)[1].strip()
         res = engine.manual_sell(token)
         tg_send(chat_id or ADMIN_CHAT_ID, res)
     else:
-        tg_send(chat_id or ADMIN_CHAT_ID, "Commands: /status, /mode mock|live, /pause, /resume, /buy, /sell")
-
+        tg_send(
+            chat_id or ADMIN_CHAT_ID,
+            "Commands:\n"
+            "/status\n"
+            "/mode mock|live\n"
+            "/pause\n"
+            "/resume\n"
+            "/buy <token>\n"
+            "/sell <token>",
+        )
     return Response("ok", status=200)
+
 
 # ===== BOOT =====
 def boot():
@@ -127,7 +157,10 @@ def boot():
     if AUTO_START:
         engine.resume()
 
+
+# Run boot at import (works under gunicorn -w 1)
 boot()
 
+# Local dev path if ever needed
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=PORT)
