@@ -1,4 +1,4 @@
-# bot.py — full version (webhook + APScheduler + keepalive + robust logging)
+# bot.py — full version (webhook + APScheduler + keepalive + robust logging + /positions + /pnl)
 
 import os
 import json
@@ -46,7 +46,7 @@ def tg_send(chat_id: str, text: str):
 # ===== ENGINE =====
 from trademachine import TradeMachine
 
-# *** FIX: pass tg_sender required by TradeMachine.__init__ ***
+# pass tg_sender required by TradeMachine.__init__
 engine = TradeMachine(tg_sender=tg_send)
 
 # (Optional compatibility: if engine supports setter we still wire it, no harm)
@@ -139,7 +139,7 @@ def root():
 def healthz():
     return Response("healthy", status=200)
 
-# --- ADD: self-test endpoint to simulate Telegram POST quickly ---
+# self-test endpoint to simulate Telegram POST quickly
 @app.route("/__selftest", methods=["POST"])
 def __selftest():
     """POST JSON: {"chat_id": "<id>", "text": "/ping"} to test handler end-to-end on Render."""
@@ -155,7 +155,7 @@ def __selftest():
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    # --- ADD: log headers + compact payload so we can see hits in Render logs
+    # log headers + compact payload so we can see hits in Render logs
     try:
         logger.info("Webhook headers: %s", dict(request.headers))
     except Exception:
@@ -178,6 +178,7 @@ def webhook():
 
     low = text.lower()
 
+    # -------- commands --------
     if low.startswith("/start"):
         tg_send(chat_id, "🐯 Stripe Tiger bot is live.")
         return Response("ok", status=200)
@@ -191,6 +192,38 @@ def webhook():
         except Exception as e:
             logger.exception("status")
             tg_send(chat_id, f"Status error: {e}")
+        return Response("ok", status=200)
+
+    # NEW: positions snapshot
+    if low.startswith("/positions"):
+        try:
+            if hasattr(engine, "get_positions"):
+                pos = engine.get_positions()
+                if not pos:
+                    tg_send(chat_id, "No open positions.")
+                else:
+                    lines = []
+                    for p in pos:
+                        lines.append(
+                            f"{p.get('token')[:8]}… on {p.get('chain','')} | "
+                            f"qty={p.get('qty',0):.6f} @ avg=${(p.get('avg_price') or 0):.6f}"
+                        )
+                    tg_send(chat_id, "📊 Positions:\n" + "\n".join(lines))
+            else:
+                tg_send(chat_id, "get_positions() not implemented in engine.")
+        except Exception as e:
+            logger.exception("positions")
+            tg_send(chat_id, f"Positions error: {e}")
+        return Response("ok", status=200)
+
+    # NEW: pnl snapshot
+    if low.startswith("/pnl"):
+        try:
+            pnl = getattr(engine, "pnl_usd", 0.0)
+            tg_send(chat_id, f"💰 PnL (approx): ${pnl:.2f}")
+        except Exception as e:
+            logger.exception("pnl")
+            tg_send(chat_id, f"PnL error: {e}")
         return Response("ok", status=200)
 
     if low.startswith("/mode"):
@@ -263,9 +296,10 @@ def webhook():
         tg_send(chat_id, "pong")
         return Response("ok", status=200)
 
+    # default help
     tg_send(
         chat_id,
-        "Commands: /start /status /mode mock|live /pause /resume /buy <token> /sell <token> /ping"
+        "Commands: /start /status /positions /pnl /mode mock|live /pause /resume /buy <token> /sell <token> /ping"
     )
     return Response("ok", status=200)
 
