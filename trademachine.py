@@ -195,17 +195,51 @@ class TradeMachine:
         self.log_event_cb = None  # bot.py may set: engine.log_event_cb = log_event
         self._alert_chat_id = ALERT_CHAT_ID or TELEGRAM_CHAT_ID
 
-        logger.info(f"Engine init | mode={self.mode} poll={self.poll_seconds}s | autotune={AUTO_TUNE}")
+        # ====== ADDED: startup logs (masked) ======
+        def _mask(addr: Optional[str]) -> str:
+            if not addr or len(addr) < 10:
+                return "MISSING"
+            return f"{addr[:6]}...{addr[-4:]}"
+
+        logger.info(
+            "Engine init | mode=%s poll=%ss | ETH=%s | BSC=%s | RPC_ETH=%s | RPC_BSC=%s | autotune=%s",
+            self.mode, self.poll_seconds, _mask(ETH_TOKEN_ADDRESS), _mask(BSC_TOKEN_ADDRESS),
+            "yes" if RPC_URL_ETH else "no", "yes" if RPC_URL_BSC else "no", AUTO_TUNE
+        )
+        # ====== ADDED: announce ready to Telegram ======
+        try:
+            self._notify(
+                f"🤖 Engine ready\n"
+                f"• Mode: {self.mode}\n"
+                f"• Poll: {self.poll_seconds}s\n"
+                f"• ETH token: {_mask(ETH_TOKEN_ADDRESS)}\n"
+                f"• BSC token: {_mask(BSC_TOKEN_ADDRESS)}\n"
+                f"• Autotune: {AUTO_TUNE} (warmup={TUNE_WARMUP}, every={TUNE_EVERY})"
+            )
+        except Exception:
+            pass
 
     # ----- controls -----
     def set_mode(self, mode: str):
         self.mode = mode
+        self._notify(f"⚙️ Mode switched to {mode}")
 
     def pause(self):
         self.paused = True
+        self._notify("⏸️ Engine paused")
 
     def resume(self):
         self.paused = False
+        self._notify("▶️ Engine resumed")
+
+    def set_sender(self, cb):
+        """Optional setter if caller wants to re-wire Telegram sender at runtime."""
+        try:
+            if callable(cb):
+                self.tg = cb
+                self._notify("🔌 Sender re-wired")
+        except Exception:
+            pass
 
     def short_status(self):
         return f"mode={self.mode} paused={self.paused} positions={len(self.positions)} pnl≈{self.pnl_usd:.2f}"
@@ -303,6 +337,14 @@ class TradeMachine:
                 s_slow = pw.sma(SMA_SLOW)
                 rsi = pw.rsi()
                 ai_p = self.ai[token].prob_up()
+
+                # periodic “thinking” log to Telegram (every 20 cycles)
+                if self._cycle % 20 == 0:
+                    self._notify(
+                        f"🧠 {token} {chain} | p=${(price or 0):.6f} | "
+                        f"SMA{SMA_FAST}/{SMA_SLOW}={(s_fast or 0):.6f}/{(s_slow or 0):.6f} "
+                        f"| RSI={(rsi or 0):.2f} | AI={ai_p:.2f}"
+                    )
 
                 # 3) Optional: Auto-tune from distributions
                 if AUTO_TUNE and not LOCK_TUNED:
