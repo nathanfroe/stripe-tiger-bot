@@ -33,18 +33,18 @@ POLL_SECONDS = int(os.getenv("POLL_SECONDS", "60"))
 ALLOCATION_USD = float(os.getenv("ALLOCATION_USD", os.getenv("TRADE_USD_PER_TRADE", "50")))
 
 # Baseline (starting) thresholds
-AI_MIN_PROB_BUY  = float(os.getenv("AI_MIN_PROB_BUY",  "0.55"))
+AI_MIN_PROB_BUY = float(os.getenv("AI_MIN_PROB_BUY", "0.55"))
 AI_MAX_PROB_SELL = float(os.getenv("AI_MAX_PROB_SELL", "0.45"))
-RSI_BUY          = float(os.getenv("RSI_BUY", "55"))
-RSI_SELL         = float(os.getenv("RSI_SELL", "45"))
-SMA_FAST         = int(os.getenv("SMA_FAST", "20"))
-SMA_SLOW         = int(os.getenv("SMA_SLOW", "50"))
+RSI_BUY = float(os.getenv("RSI_BUY", "55"))
+RSI_SELL = float(os.getenv("RSI_SELL", "45"))
+SMA_FAST = int(os.getenv("SMA_FAST", "20"))
+SMA_SLOW = int(os.getenv("SMA_SLOW", "50"))
 
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") or os.getenv("ADMIN_CHAT_ID")
-ALERT_CHAT_ID    = os.getenv("ALERT_CHAT_ID") or TELEGRAM_CHAT_ID  # fallback if provided
+ALERT_CHAT_ID = os.getenv("ALERT_CHAT_ID") or TELEGRAM_CHAT_ID  # fallback if provided
 
 # Auto-tune controls
-AUTO_TUNE  = os.getenv("AUTO_TUNE", "true").lower() == "true"
+AUTO_TUNE = os.getenv("AUTO_TUNE", "true").lower() == "true"
 TUNE_WARMUP = int(os.getenv("TUNE_WARMUP", "50"))      # min samples before first tune per token
 TUNE_EVERY  = int(os.getenv("TUNE_EVERY",  "60"))      # tune cadence in cycles
 LOCK_TUNED  = os.getenv("LOCK_TUNED", "false").lower() == "true"
@@ -157,24 +157,6 @@ def _base_price_usd(chain: str) -> Optional[float]:
 
 # ================= Engine =================
 class TradeMachine:
-    """
-    Core trading engine. Supports:
-      • mock/live modes
-      • ETH/BSC via DEX execution (DexExecutor)
-      • auto-tuning of thresholds
-      • structured event logging via log_event_cb
-    """
-    # allow runtime param updates from bot (/set)
-    MUTABLE_FLOATS = {
-        "AI_MIN_PROB_BUY", "AI_MAX_PROB_SELL",
-        "RSI_BUY", "RSI_SELL",
-        "ALLOCATION_USD",
-        "AI_BUY_Q", "AI_SELL_Q", "RSI_BUY_Q", "RSI_SELL_Q",
-        "MIN_LIQ_USD"
-    }
-    MUTABLE_INTS = {"SMA_FAST", "SMA_SLOW", "POLL_SECONDS", "SLIPPAGE_BPS", "BASE_EOA_GAS_LIMIT", "TUNE_WARMUP", "TUNE_EVERY"}
-    MUTABLE_BOOLEANS = {"AUTO_TUNE", "LOCK_TUNED"}
-
     def __init__(self, tg_sender):
         self.tg = tg_sender
         self.mode = TRADE_MODE
@@ -224,11 +206,14 @@ class TradeMachine:
             self.mode, self.poll_seconds, _mask(ETH_TOKEN_ADDRESS), _mask(BSC_TOKEN_ADDRESS),
             "yes" if RPC_URL_ETH else "no", "yes" if RPC_URL_BSC else "no", AUTO_TUNE
         )
+        # announce ready to Telegram
         try:
             self._notify(
                 f"🤖 Engine ready\n"
                 f"• Mode: {self.mode}\n"
                 f"• Poll: {self.poll_seconds}s\n"
+                f"• ETH token: {_mask(ETH_TOKEN_ADDRESS)}\n"
+                f"• BSC token: {_mask(BSC_TOKEN_ADDRESS)}\n"
                 f"• Autotune: {AUTO_TUNE} (warmup={TUNE_WARMUP}, every={TUNE_EVERY})"
             )
         except Exception:
@@ -248,6 +233,7 @@ class TradeMachine:
         self._notify("▶️ Engine resumed")
 
     def set_sender(self, cb):
+        """Optional setter if caller wants to re-wire Telegram sender at runtime."""
         try:
             if callable(cb):
                 self.tg = cb
@@ -280,56 +266,9 @@ class TradeMachine:
         for token in list(self.tuned_rsi_buy.keys()):
             yield (token, (round(self.tuned_rsi_buy[token],1), round(self.tuned_rsi_sell[token],1)))
 
-    # ----- runtime configuration from bot (/set NAME VALUE) -----
-    def set_param(self, name: str, value: str) -> str:
-        global AI_MIN_PROB_BUY, AI_MAX_PROB_SELL, RSI_BUY, RSI_SELL
-        global ALLOCATION_USD, AI_BUY_Q, AI_SELL_Q, RSI_BUY_Q, RSI_SELL_Q
-        global MIN_LIQ_USD, SMA_FAST, SMA_SLOW, POLL_SECONDS, SLIPPAGE_BPS, BASE_EOA_GAS_LIMIT
-        global TUNE_WARMUP, TUNE_EVERY, AUTO_TUNE, LOCK_TUNED
-
-        key = name.strip().upper()
-        try:
-            if key in self.MUTABLE_FLOATS:
-                val = float(value)
-                locals_before = {
-                    "AI_MIN_PROB_BUY": AI_MIN_PROB_BUY, "AI_MAX_PROB_SELL": AI_MAX_PROB_SELL,
-                    "RSI_BUY": RSI_BUY, "RSI_SELL": RSI_SELL, "ALLOCATION_USD": ALLOCATION_USD,
-                    "AI_BUY_Q": AI_BUY_Q, "AI_SELL_Q": AI_SELL_Q, "RSI_BUY_Q": RSI_BUY_Q, "RSI_SELL_Q": RSI_SELL_Q,
-                    "MIN_LIQ_USD": MIN_LIQ_USD
-                }
-                globals()[key] = val
-                return f"Set {key} from {locals_before.get(key)} to {val}"
-
-            if key in self.MUTABLE_INTS:
-                val = int(value)
-                if key == "SMA_FAST":
-                    globals()["SMA_FAST"] = val
-                elif key == "SMA_SLOW":
-                    globals()["SMA_SLOW"] = val
-                elif key == "POLL_SECONDS":
-                    self.poll_seconds = val
-                    globals()["POLL_SECONDS"] = val
-                elif key == "SLIPPAGE_BPS":
-                    globals()["SLIPPAGE_BPS"] = val
-                elif key == "BASE_EOA_GAS_LIMIT":
-                    globals()["BASE_EOA_GAS_LIMIT"] = val
-                elif key == "TUNE_WARMUP":
-                    globals()["TUNE_WARMUP"] = val
-                elif key == "TUNE_EVERY":
-                    globals()["TUNE_EVERY"] = val
-                return f"Set {key} to {val}"
-
-            if key in self.MUTABLE_BOOLEANS:
-                val = value.lower() in ("1", "true", "yes", "on")
-                globals()[key] = val
-                return f"Set {key} to {val}"
-
-            return f"Unknown/immutable param: {key}"
-        except Exception as e:
-            return f"Failed to set {key}: {e}"
-
-    # ===== accessor =====
+    # ----- accessors / recorder -----
     def get_positions(self):
+        """Return positions as a list of dicts for chat/debug/dashboard."""
         out = []
         for token, pos in (self.positions or {}).items():
             out.append({
@@ -340,8 +279,8 @@ class TradeMachine:
             })
         return out
 
-    # ===== event recorder hook =====
     def _record(self, kind: str, **kw):
+        """If a callback is attached (via bot.py), write structured events; otherwise no-op."""
         try:
             cb = getattr(self, "log_event_cb", None)
             if callable(cb):
@@ -398,7 +337,7 @@ class TradeMachine:
                 rsi = pw.rsi()
                 ai_p = self.ai[token].prob_up()
 
-                # periodic “thinking” log (every 20 cycles)
+                # periodic “thinking” log to Telegram (every 20 cycles)
                 if self._cycle % 20 == 0:
                     self._notify(
                         f"🧠 {token} {chain} | p=${(price or 0):.6f} | "
@@ -407,7 +346,7 @@ class TradeMachine:
                     )
 
                 # 3) Optional: Auto-tune from distributions
-                if AUTO_TUNE && not LOCK_TUNED:
+                if AUTO_TUNE and not LOCK_TUNED:
                     self._maybe_autotune(token)
 
                 # 4) Decide using tuned thresholds (fallback to baseline if not tuned)
@@ -422,12 +361,20 @@ class TradeMachine:
 
                     if want_buy:
                         res = self._execute(chain, "buy", token, ALLOCATION_USD)
-                        self._notify(f"🟢 BUY {token} {chain} | p=${price:.6f} | SMA {SMA_FAST}/{SMA_SLOW}={s_fast:.6f}/{s_slow:.6f} | RSI={rsi:.2f}≥{rsi_b:.2f} | AI={ai_p:.2f}≥{ai_buy:.2f}\n{res}")
+                        self._notify(
+                            f"🟢 BUY {token} {chain} | p=${price:.6f} | "
+                            f"SMA {SMA_FAST}/{SMA_SLOW}={s_fast:.6f}/{s_slow:.6f} | "
+                            f"RSI={rsi:.2f}≥{rsi_b:.2f} | AI={ai_p:.2f}≥{ai_buy:.2f}\n{res}"
+                        )
                         self._record("signal", token=token, chain=chain, side="buy", price=price,
                                      rsi=rsi, ai=ai_p, s_fast=s_fast, s_slow=s_slow)
                     elif want_sell:
                         res = self._execute(chain, "sell", token, ALLOCATION_USD)
-                        self._notify(f"🔴 SELL {token} {chain} | p=${price:.6f} | SMA {SMA_FAST}/{SMA_SLOW}={s_fast:.6f}/{s_slow:.6f} | RSI={rsi:.2f}≤{rsi_s:.2f} | AI={ai_p:.2f}≤{ai_sell:.2f}\n{res}")
+                        self._notify(
+                            f"🔴 SELL {token} {chain} | p=${price:.6f} | "
+                            f"SMA {SMA_FAST}/{SMA_SLOW}={s_fast:.6f}/{s_slow:.6f} | "
+                            f"RSI={rsi:.2f}≤{rsi_s:.2f} | AI={ai_p:.2f}≤{ai_sell:.2f}\n{res}"
+                        )
                         self._record("signal", token=token, chain=chain, side="sell", price=price,
                                      rsi=rsi, ai=ai_p, s_fast=s_fast, s_slow=s_slow)
 
@@ -456,10 +403,12 @@ class TradeMachine:
 
         ai_vals = list(self.ai[token].history)[-max(2*TUNE_WARMUP, 200):]
 
+        # Only tune if we have enough samples
         if len(ai_vals) >= TUNE_WARMUP:
             ai_buy_q  = _quantile(ai_vals, AI_BUY_Q)
             ai_sell_q = _quantile(ai_vals, AI_SELL_Q)
             if ai_buy_q is not None and ai_sell_q is not None:
+                # Keep a safety margin so buy >= sell + 0.05
                 if ai_buy_q < ai_sell_q + 0.05:
                     ai_buy_q = min(0.95, ai_sell_q + 0.05)
                 self.tuned_ai_buy[token]  = round(float(ai_buy_q), 4)
@@ -469,6 +418,7 @@ class TradeMachine:
             rsi_buy_q  = _quantile(rsi_vals, RSI_BUY_Q)
             rsi_sell_q = _quantile(rsi_vals, RSI_SELL_Q)
             if rsi_buy_q is not None and rsi_sell_q is not None:
+                # Safety margin so buy >= sell + 5
                 if rsi_buy_q < rsi_sell_q + 5:
                     rsi_buy_q = min(90.0, rsi_sell_q + 5)
                 self.tuned_rsi_buy[token]  = round(float(rsi_buy_q), 2)
@@ -489,7 +439,8 @@ class TradeMachine:
                 return "[MOCK] no price"
 
             # record submit (mock)
-            self._record("order_submitted", token=token_addr, chain=chain, side=side, price=price, usd=usd_amount, tx=None)
+            self._record("order_submitted", token=token_addr, chain=chain, side=side,
+                         price=price, usd=usd_amount, tx=None)
 
             pos = self.positions.get(token_addr, Position(qty=0.0, avg=0.0, chain=chain))
             if side == "buy":
@@ -499,8 +450,9 @@ class TradeMachine:
                 pos.qty = new_qty
                 self.positions[token_addr] = pos
 
-                self._record("fill", token=token_addr, chain=chain, side="buy", qty=units, price=price, tx=None)
-
+                # record fill (mock)
+                self._record("fill", token=token_addr, chain=chain, side="buy",
+                             qty=units, price=price, tx=None)
             else:
                 if pos.qty <= 0:
                     return "[MOCK] no position to sell"
@@ -511,9 +463,12 @@ class TradeMachine:
                     pos.avg = 0.0
                 self.positions[token_addr] = pos
 
-                self._record("fill", token=token_addr, chain=chain, side="sell", qty=units, price=price, tx=None)
+                # record fill (mock)
+                self._record("fill", token=token_addr, chain=chain, side="sell",
+                             qty=units, price=price, tx=None)
 
-            return f"[MOCK] {side.upper()} {token_addr} on {chain} for ~${usd_amount:.2f} | pos={pos.qty:.6f}@{pos.avg:.6f} | PnL≈${self.pnl_usd:.2f}"
+            return (f"[MOCK] {side.upper()} {token_addr} on {chain} for ~${usd_amount:.2f} | "
+                    f"pos={pos.qty:.6f}@{pos.avg:.6f} | PnL≈${self.pnl_usd:.2f}")
 
         # LIVE mode
         if EXECUTION_MODE != "DEX":
@@ -530,10 +485,12 @@ class TradeMachine:
             else:
                 txh = self.dex.sell(chain, token_addr, usd_amount)
 
-            self._record("order_submitted", token=token_addr, chain=chain, side=side, price=base_price, usd=usd_amount, tx=txh)
+            # record submit (live)
+            self._record("order_submitted", token=token_addr, chain=chain, side=side,
+                         price=base_price, usd=usd_amount, tx=txh)
             self._notify(f"📝 LIVE {side.upper()} {token_addr} ({chain}) tx={txh}")
 
-            # When you confirm, you can also:
+            # Later on confirmation you can also call:
             # self._record("fill", token=token_addr, chain=chain, side=side, price=fill_price, tx=txh)
 
             return f"[LIVE] {side.upper()} {token_addr} on {chain} ~${usd_amount:.2f} | tx={txh}"
@@ -544,7 +501,11 @@ class TradeMachine:
 
     # ----- utilities -----
     def _notify(self, text: str):
-        # use injected sender if present
+        """
+        Prefer the injected tg_sender (from bot.py). If not present, fall back to
+        the original direct HTTP send using TELEGRAM_BOT_TOKEN and chat id.
+        """
+        # Preferred: callback
         try:
             target = self._alert_chat_id or TELEGRAM_CHAT_ID
             if getattr(self, "tg", None) and target:
@@ -553,7 +514,7 @@ class TradeMachine:
         except Exception:
             pass
 
-        # fallback direct HTTP
+        # Fallback: direct HTTP
         if TELEGRAM_CHAT_ID:
             try:
                 token = os.getenv("TELEGRAM_BOT_TOKEN")
