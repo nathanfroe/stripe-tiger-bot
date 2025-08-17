@@ -1,13 +1,12 @@
-# bot.py — full version (webhook + APScheduler + keepalive + robust logging + event buffer)
+# bot.py — webhook + APScheduler + keepalive + richer commands/diagnostics
 
 import os
 import json
 import logging
-from collections import deque
 from datetime import datetime, timezone as dt_tz
 
 import requests
-from flask import Flask, request, Response, jsonify
+from flask import Flask, request, Response
 from apscheduler.schedulers.background import BackgroundScheduler
 from tenacity import retry, stop_after_attempt, wait_exponential
 
@@ -29,19 +28,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("bot")
 
-# ===== EVENT BUFFER (for quick visibility & debugging) =====
-EVENTS = deque(maxlen=200)
-EVENTS_PATH = "/tmp/events.jsonl"
-
-def _append_event(kind: str, **kw):
-    ev = {"ts": datetime.now(dt_tz.utc).isoformat(timespec="seconds"), "kind": kind, **kw}
-    EVENTS.append(ev)
-    try:
-        with open(EVENTS_PATH, "a", encoding="utf-8") as f:
-            f.write(json.dumps(ev) + "\n")
-    except Exception:
-        pass
-
 # ===== Telegram send helper =====
 def tg_send(chat_id: str, text: str):
     if not TOKEN or not chat_id:
@@ -58,21 +44,22 @@ def tg_send(chat_id: str, text: str):
         logger.exception("Telegram send error: %s", e)
 
 # ===== ENGINE =====
-from trademachine import TradeMachine
+from trademachine import (
+    TradeMachine,
+    _best_dexscreener_pair_usd,  # we intentionally re-use the module helper for /price
+    ETH_TOKEN_ADDRESS,
+    BSC_TOKEN_ADDRESS,
+)
+
 engine = TradeMachine(tg_sender=tg_send)
 
-# Wire structured event logger into engine
-def log_event(kind: str, **kw):
-    _append_event(kind, **kw)
-    # Optionally notify on high-signal events
-    try:
-        if kind in {"signal", "fill", "error"} and ALERT_CHAT_ID:
-            short = f"evt={kind} | " + ", ".join(f"{k}={kw[k]}" for k in ("token","chain","side") if k in kw)
-            tg_send(ALERT_CHAT_ID, f"📒 {short}")
-    except Exception:
-        pass
-
-setattr(engine, "log_event_cb", log_event)
+# Optional compatibility setter (no harm if absent)
+try:
+    if hasattr(engine, "set_sender"):
+        engine.set_sender(tg_send)
+        tg_send(ALERT_CHAT_ID, "🔌 Sender re-wired")
+except Exception as e:
+    logger.warning("Could not attach Telegram sender to engine: %s", e)
 
 # ===== FLASK APP =====
 app = Flask(__name__)
@@ -114,6 +101,7 @@ def start_jobs():
     sched.add_job(trading_cycle, "interval", seconds=poll_secs, id="trading_cycle", replace_existing=True)
     if SELF_URL:
         sched.add_job(keepalive, "interval", seconds=300, id="keepalive", replace_existing=True)
+
     if not sched.running:
         sched.start()
     logger.info("Scheduler started.")
@@ -154,7 +142,7 @@ def root():
 def healthz():
     return Response("healthy", status=200)
 
-# Self-test endpoint to simulate Telegram POST quickly
+# Self-test endpoint for Render
 @app.route("/__selftest", methods=["POST"])
 def __selftest():
     """POST JSON: {"chat_id": "<id>", "text": "/ping"} to test handler end-to-end on Render."""
@@ -168,11 +156,20 @@ def __selftest():
     with app.test_request_context("/webhook", method="POST", json=fake):
         return webhook()
 
-# Quick JSON view of recent events (no secrets)
-@app.route("/events", methods=["GET"])
-def events():
-    return jsonify(list(EVENTS))
+# ===== UTIL =====
+def _fmt_price_line(chain: str, token_addr: str) -> str:
+    if not token_addr:
+        return f"{chain}: (no token configured)"
+    try:
+        price, liq = _best_dexscreener_pair_usd(token_addr, chain)
+        if price is None or liq is None:
+            return f"{chain}: {token_addr} → No price/liquidity"
+        return f"{chain}: {token_addr[:6]}...{token_addr[-4:]} → ${price:.6f} | liq≈${liq:,.0f}"
+    except Exception as e:
+        logger.exception("price fetch error")
+        return f"{chain}: error: {e}"
 
+# ===== TELEGRAM WEBHOOK =====
 @app.route("/webhook", methods=["POST"])
 def webhook():
     try:
@@ -195,16 +192,17 @@ def webhook():
     if not text:
         return Response("no-text", status=200)
 
-    low = text.lower().strip()
-    parts = low.split()
+    low = text.lower()
 
-    # ------- COMMANDS -------
+    # ------- Commands -------
     if low.startswith("/start"):
         tg_send(chat_id, "🐯 Stripe Tiger bot is live.")
-        return Response("ok", status=200)
-
-    if low.startswith("/ping"):
-        tg_send(chat_id, "pong")
+        # send a quick status so you see current config right away
+        try:
+            if hasattr(engine, "status_text"):
+                tg_send(chat_id, engine.status_text())
+        except Exception:
+            pass
         return Response("ok", status=200)
 
     if low.startswith("/status"):
@@ -218,25 +216,9 @@ def webhook():
             tg_send(chat_id, f"Status error: {e}")
         return Response("ok", status=200)
 
-    if low.startswith("/positions"):
+    if low.startswith("/mode"):
         try:
-            if hasattr(engine, "get_positions"):
-                rows = engine.get_positions()
-                if not rows:
-                    tg_send(chat_id, "No positions.")
-                else:
-                    lines = ["Positions:"]
-                    for r in rows:
-                        lines.append(f"- {r['token']} ({r['chain']}): qty={r['qty']:.6f} avg={r['avg_price']}")
-                    tg_send(chat_id, "\n".join(lines))
-            else:
-                tg_send(chat_id, "get_positions() not implemented.")
-        except Exception as e:
-            tg_send(chat_id, f"Positions error: {e}")
-        return Response("ok", status=200)
-
-    if low.startswith("/mode "):
-        try:
+            parts = low.split()
             if len(parts) == 2 and parts[1] in ("mock", "live"):
                 if hasattr(engine, "set_mode"):
                     engine.set_mode(parts[1])
@@ -278,7 +260,7 @@ def webhook():
         token = text.split(" ", 1)[1].strip() if " " in text else ""
         try:
             if hasattr(engine, "manual_buy"):
-                res = engine.manual_buy(token)
+                res = engine.manual_buy(token or ETH_TOKEN_ADDRESS or BSC_TOKEN_ADDRESS or "")
                 tg_send(chat_id, res or "Buy attempted.")
             else:
                 tg_send(chat_id, "manual_buy() not implemented in engine.")
@@ -291,7 +273,7 @@ def webhook():
         token = text.split(" ", 1)[1].strip() if " " in text else ""
         try:
             if hasattr(engine, "manual_sell"):
-                res = engine.manual_sell(token)
+                res = engine.manual_sell(token or ETH_TOKEN_ADDRESS or BSC_TOKEN_ADDRESS or "")
                 tg_send(chat_id, res or "Sell attempted.")
             else:
                 tg_send(chat_id, "manual_sell() not implemented in engine.")
@@ -300,47 +282,64 @@ def webhook():
             tg_send(chat_id, f"Sell error: {e}")
         return Response("ok", status=200)
 
-    # /set NAME VALUE  -> live-tune params (e.g., /set POLL_SECONDS 30)
-    if low.startswith("/set "):
-        try:
-            _, name, value = text.split(maxsplit=2)
-            if hasattr(engine, "set_param"):
-                out = engine.set_param(name, value)
-                tg_send(chat_id, out)
-                # if poll changed, reschedule trading job
-                if name.strip().upper() == "POLL_SECONDS":
-                    try:
-                        from apscheduler.jobstores.base import ConflictingIdError
-                        sched.remove_job("trading_cycle")
-                    except Exception:
-                        pass
-                    sched.add_job(trading_cycle, "interval", seconds=engine.poll_seconds, id="trading_cycle", replace_existing=True)
-                    tg_send(chat_id, f"Rescheduled trading cycle to {engine.poll_seconds}s")
-            else:
-                tg_send(chat_id, "set_param() not implemented in engine.")
-        except Exception as e:
-            tg_send(chat_id, f"/set error: {e}")
+    # --- NEW: /price -> show current price/liquidity for configured tokens
+    if low.startswith("/price"):
+        lines = ["📈 Prices (Dexscreener):"]
+        lines.append(_fmt_price_line("ETH", ETH_TOKEN_ADDRESS))
+        lines.append(_fmt_price_line("BSC", BSC_TOKEN_ADDRESS))
+        tg_send(chat_id, "\n".join(lines))
         return Response("ok", status=200)
 
-    # /events -> last 20 events
-    if low.startswith("/events"):
+    # --- NEW: /positions -> list open positions
+    if low.startswith("/positions"):
         try:
-            sample = list(EVENTS)[-20:]
-            if not sample:
-                tg_send(chat_id, "No recent events.")
+            pos = []
+            if hasattr(engine, "get_positions"):
+                for p in engine.get_positions():
+                    pos.append(f"{p['chain']} {p['token'][:6]}...{p['token'][-4:]} qty={p['qty']:.6f} avg={p['avg_price']}")
+            if not pos:
+                tg_send(chat_id, "No positions.")
             else:
-                lines = ["Recent events:"]
-                for ev in sample:
-                    lines.append(f"- {ev['ts']} | {ev.get('kind')} | {ev.get('token','')} {ev.get('chain','')} {ev.get('side','')}")
-                tg_send(chat_id, "\n".join(lines))
+                tg_send(chat_id, "📦 Positions:\n" + "\n".join(pos))
         except Exception as e:
-            tg_send(chat_id, f"Events error: {e}")
+            logger.exception("positions")
+            tg_send(chat_id, f"Positions error: {e}")
+        return Response("ok", status=200)
+
+    # --- NEW: /pnl -> running PnL
+    if low.startswith("/pnl"):
+        try:
+            pnl = getattr(engine, "pnl_usd", 0.0)
+            count = len(getattr(engine, "positions", {}) or {})
+            tg_send(chat_id, f"💰 PnL≈${pnl:.2f} | positions={count}")
+        except Exception as e:
+            logger.exception("pnl")
+            tg_send(chat_id, f"PnL error: {e}")
+        return Response("ok", status=200)
+
+    # --- NEW: /cycle or /think -> force one immediate engine cycle
+    if low.startswith("/cycle") or low.startswith("/think"):
+        try:
+            if hasattr(engine, "run_cycle"):
+                engine.run_cycle()
+                tg_send(chat_id, "🔁 Ran one cycle.")
+            else:
+                tg_send(chat_id, "run_cycle() not implemented in engine.")
+        except Exception as e:
+            logger.exception("cycle-now")
+            tg_send(chat_id, f"Cycle error: {e}")
+        return Response("ok", status=200)
+
+    if low.startswith("/ping"):
+        tg_send(chat_id, "pong")
         return Response("ok", status=200)
 
     tg_send(
         chat_id,
-        "Commands: /start /status /positions /mode mock|live /pause /resume "
-        "/buy <token> /sell <token> /set <NAME> <VALUE> /events /ping"
+        "Commands:\n"
+        "/start /status /mode mock|live /pause /resume\n"
+        "/price /positions /pnl /cycle\n"
+        "/buy <token> /sell <token> /ping"
     )
     return Response("ok", status=200)
 
@@ -351,11 +350,17 @@ def boot():
     except Exception as e:
         logger.warning("Webhook not set: %s", e)
     start_jobs()
+
+    # Boot pings
     try:
         if ADMIN_CHAT_ID:
             tg_send(ADMIN_CHAT_ID, "✅ Boot OK (service live)")
+            # auto status so you immediately see config after deploy
+            if hasattr(engine, "status_text"):
+                tg_send(ADMIN_CHAT_ID, engine.status_text())
     except Exception:
         pass
+
     if AUTO_START:
         try:
             if hasattr(engine, "resume"):
