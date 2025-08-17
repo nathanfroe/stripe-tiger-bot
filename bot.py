@@ -1,8 +1,9 @@
-# bot.py — webhook + APScheduler + keepalive + richer commands/diagnostics
+# bot.py — webhook + APScheduler + keepalive + rich commands + event log
 
 import os
 import json
 import logging
+from collections import deque
 from datetime import datetime, timezone as dt_tz
 
 import requests
@@ -46,14 +47,32 @@ def tg_send(chat_id: str, text: str):
 # ===== ENGINE =====
 from trademachine import (
     TradeMachine,
-    _best_dexscreener_pair_usd,  # we intentionally re-use the module helper for /price
+    _best_dexscreener_pair_usd,
     ETH_TOKEN_ADDRESS,
     BSC_TOKEN_ADDRESS,
 )
 
-engine = TradeMachine(tg_sender=tg_send)
+# simple in-memory event log (engine will write here via callback)
+EVENTS = deque(maxlen=300)
 
-# Optional compatibility setter (no harm if absent)
+def _log_event(kind: str, **kw):
+    ts = datetime.now(dt_tz.utc).isoformat(timespec="seconds")
+    EVENTS.append((ts, kind, kw))
+    # also mirror critical items to alert chat
+    if kind in ("error", "warn"):
+        try:
+            tg_send(ALERT_CHAT_ID, f"[{kind.upper()}] {kw}")
+        except Exception:
+            pass
+
+engine = TradeMachine(tg_sender=tg_send)
+# wire the event logger if engine exposes the hook
+try:
+    setattr(engine, "log_event_cb", _log_event)
+except Exception:
+    pass
+
+# Optional rewire confirmation
 try:
     if hasattr(engine, "set_sender"):
         engine.set_sender(tg_send)
@@ -142,10 +161,9 @@ def root():
 def healthz():
     return Response("healthy", status=200)
 
-# Self-test endpoint for Render
+# Self-test endpoint for Render (simulate a Telegram POST)
 @app.route("/__selftest", methods=["POST"])
 def __selftest():
-    """POST JSON: {"chat_id": "<id>", "text": "/ping"} to test handler end-to-end on Render."""
     data = request.get_json(silent=True) or {}
     fake = {
         "message": {
@@ -156,18 +174,30 @@ def __selftest():
     with app.test_request_context("/webhook", method="POST", json=fake):
         return webhook()
 
-# ===== UTIL =====
+# ===== HELPERS =====
 def _fmt_price_line(chain: str, token_addr: str) -> str:
     if not token_addr:
         return f"{chain}: (no token configured)"
     try:
         price, liq = _best_dexscreener_pair_usd(token_addr, chain)
         if price is None or liq is None:
-            return f"{chain}: {token_addr} → No price/liquidity"
+            return f"{chain}: {token_addr[:6]}...{token_addr[-4:]} → No price/liquidity"
         return f"{chain}: {token_addr[:6]}...{token_addr[-4:]} → ${price:.6f} | liq≈${liq:,.0f}"
     except Exception as e:
         logger.exception("price fetch error")
         return f"{chain}: error: {e}"
+
+def _events_tail(n: int = 20) -> str:
+    items = list(EVENTS)[-n:]
+    if not items:
+        return "(no recent events)"
+    lines = []
+    for ts, kind, kw in items:
+        short = json.dumps(kw, separators=(",", ":"), ensure_ascii=False)
+        if len(short) > 160:
+            short = short[:157] + "…"
+        lines.append(f"{ts} | {kind}: {short}")
+    return "\n".join(lines)
 
 # ===== TELEGRAM WEBHOOK =====
 @app.route("/webhook", methods=["POST"])
@@ -188,16 +218,14 @@ def webhook():
     chat_id = str((msg.get("chat") or {}).get("id") or "") or ADMIN_CHAT_ID
 
     logger.info("Update: chat=%s | text=%r", chat_id, text)
-
     if not text:
         return Response("no-text", status=200)
 
     low = text.lower()
 
-    # ------- Commands -------
+    # Commands
     if low.startswith("/start"):
         tg_send(chat_id, "🐯 Stripe Tiger bot is live.")
-        # send a quick status so you see current config right away
         try:
             if hasattr(engine, "status_text"):
                 tg_send(chat_id, engine.status_text())
@@ -282,31 +310,25 @@ def webhook():
             tg_send(chat_id, f"Sell error: {e}")
         return Response("ok", status=200)
 
-    # --- NEW: /price -> show current price/liquidity for configured tokens
     if low.startswith("/price"):
-        lines = ["📈 Prices (Dexscreener):"]
+        lines = ["📈 Prices:"]
         lines.append(_fmt_price_line("ETH", ETH_TOKEN_ADDRESS))
         lines.append(_fmt_price_line("BSC", BSC_TOKEN_ADDRESS))
         tg_send(chat_id, "\n".join(lines))
         return Response("ok", status=200)
 
-    # --- NEW: /positions -> list open positions
     if low.startswith("/positions"):
         try:
-            pos = []
+            out = []
             if hasattr(engine, "get_positions"):
                 for p in engine.get_positions():
-                    pos.append(f"{p['chain']} {p['token'][:6]}...{p['token'][-4:]} qty={p['qty']:.6f} avg={p['avg_price']}")
-            if not pos:
-                tg_send(chat_id, "No positions.")
-            else:
-                tg_send(chat_id, "📦 Positions:\n" + "\n".join(pos))
+                    out.append(f"{p['chain']} {p['token'][:6]}...{p['token'][-4:]} qty={p['qty']:.6f} avg={p['avg_price']}")
+            tg_send(chat_id, "📦 Positions:\n" + ("\n".join(out) if out else "(none)"))
         except Exception as e:
             logger.exception("positions")
             tg_send(chat_id, f"Positions error: {e}")
         return Response("ok", status=200)
 
-    # --- NEW: /pnl -> running PnL
     if low.startswith("/pnl"):
         try:
             pnl = getattr(engine, "pnl_usd", 0.0)
@@ -317,7 +339,6 @@ def webhook():
             tg_send(chat_id, f"PnL error: {e}")
         return Response("ok", status=200)
 
-    # --- NEW: /cycle or /think -> force one immediate engine cycle
     if low.startswith("/cycle") or low.startswith("/think"):
         try:
             if hasattr(engine, "run_cycle"):
@@ -330,6 +351,33 @@ def webhook():
             tg_send(chat_id, f"Cycle error: {e}")
         return Response("ok", status=200)
 
+    # NEW: show recent internal events the engine recorded
+    if low.startswith("/log"):
+        try:
+            n = 30
+            parts = text.split()
+            if len(parts) == 2 and parts[1].isdigit():
+                n = max(1, min(120, int(parts[1])))
+            tg_send(chat_id, "🧾 Recent events:\n" + _events_tail(n))
+        except Exception as e:
+            logger.exception("log")
+            tg_send(chat_id, f"Log error: {e}")
+        return Response("ok", status=200)
+
+    # NEW: webhook info (debug why commands aren’t reaching you)
+    if low.startswith("/wh"):
+        try:
+            info = _get_wh_info()
+            # short summary
+            last_err = info.get("last_error_message") or "none"
+            pending = info.get("pending_update_count")
+            url = info.get("url")
+            tg_send(chat_id, f"🔎 Webhook\n• url: {url}\n• pending: {pending}\n• last_error: {last_err}")
+        except Exception as e:
+            logger.exception("wh")
+            tg_send(chat_id, f"Webhook info error: {e}")
+        return Response("ok", status=200)
+
     if low.startswith("/ping"):
         tg_send(chat_id, "pong")
         return Response("ok", status=200)
@@ -338,7 +386,7 @@ def webhook():
         chat_id,
         "Commands:\n"
         "/start /status /mode mock|live /pause /resume\n"
-        "/price /positions /pnl /cycle\n"
+        "/price /positions /pnl /cycle /log [n] /wh\n"
         "/buy <token> /sell <token> /ping"
     )
     return Response("ok", status=200)
@@ -350,17 +398,13 @@ def boot():
     except Exception as e:
         logger.warning("Webhook not set: %s", e)
     start_jobs()
-
-    # Boot pings
     try:
         if ADMIN_CHAT_ID:
             tg_send(ADMIN_CHAT_ID, "✅ Boot OK (service live)")
-            # auto status so you immediately see config after deploy
             if hasattr(engine, "status_text"):
                 tg_send(ADMIN_CHAT_ID, engine.status_text())
     except Exception:
         pass
-
     if AUTO_START:
         try:
             if hasattr(engine, "resume"):
@@ -368,7 +412,6 @@ def boot():
         except Exception as e:
             logger.warning("Auto resume failed: %s", e)
 
-# Run boot at import (works under gunicorn -w 1)
 boot()
 
 if __name__ == "__main__":
