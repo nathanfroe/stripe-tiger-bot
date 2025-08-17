@@ -1,9 +1,9 @@
-# bot.py — webhook + APScheduler + keepalive + rich Telegram commands (no parse_mode)
+# bot.py — webhook watchdog + diagnostics + rich commands (no parse_mode)
 
 import os
 import json
 import logging
-from datetime import datetime, timezone as dt_tz
+from datetime import datetime, timezone as dt_tz, timedelta
 
 import requests
 from flask import Flask, request, Response
@@ -28,12 +28,19 @@ logging.basicConfig(
 )
 logger = logging.getLogger("bot")
 
-# ===== Telegram send helper (plain text; we do NOT set parse_mode) =====
+# Track last webhook hit
+LAST_WEBHOOK_AT = None
+LAST_WEBHOOK_ALERT_SENT = False
+WATCHDOG_GRACE_SEC = int(os.getenv("WEBHOOK_WATCHDOG_SEC", "300"))  # 5 min
+
+def _now_utc():
+    return datetime.now(dt_tz.utc)
+
+# ===== Telegram send helper (plain text) =====
 def tg_send(chat_id: str, text: str):
     if not TOKEN or not chat_id:
         return
     try:
-        # Telegram has a 4096 char limit; trim just in case
         if text and len(text) > 4000:
             text = text[:3990] + "\n…[truncated]"
         r = requests.post(
@@ -49,12 +56,21 @@ def tg_send(chat_id: str, text: str):
 # ===== ENGINE =====
 from trademachine import (
     TradeMachine,
-    _best_dexscreener_pair_usd,  # reuse helper for /price
+    _best_dexscreener_pair_usd,
 )
 
 engine = TradeMachine(tg_sender=tg_send)
 
-# Optional compatibility setter
+# allow re-wiring target chat at runtime
+def _set_alert_chat(chat_id: str):
+    global ALERT_CHAT_ID
+    ALERT_CHAT_ID = chat_id
+    try:
+        if hasattr(engine, "_alert_chat_id"):
+            engine._alert_chat_id = chat_id
+    except Exception:
+        pass
+
 try:
     if hasattr(engine, "set_sender"):
         engine.set_sender(tg_send)
@@ -69,7 +85,7 @@ app = Flask(__name__)
 sched = BackgroundScheduler(timezone=TZ_NAME)
 
 def heartbeat():
-    ts = datetime.now(dt_tz.utc).isoformat(timespec="seconds")
+    ts = _now_utc().isoformat(timespec="seconds")
     try:
         tg_send(ALERT_CHAT_ID, f"❤️ heartbeat {ts}")
     except Exception as e:
@@ -96,12 +112,33 @@ def keepalive():
     except Exception:
         pass
 
+def webhook_watchdog():
+    """If webhook hasn’t hit for WATCHDOG_GRACE_SEC, re-register it and alert once."""
+    global LAST_WEBHOOK_ALERT_SENT
+    try:
+        if not WEBHOOK_URL or not TOKEN:
+            return
+        if LAST_WEBHOOK_AT is None:
+            return
+        delta = (_now_utc() - LAST_WEBHOOK_AT).total_seconds()
+        if delta > WATCHDOG_GRACE_SEC:
+            ensure_webhook()
+            if not LAST_WEBHOOK_ALERT_SENT:
+                tg_send(ALERT_CHAT_ID, f"🛠️ Webhook watchdog: no hits for {int(delta)}s. Re-registered.")
+                LAST_WEBHOOK_ALERT_SENT = True
+        else:
+            LAST_WEBHOOK_ALERT_SENT = False
+    except Exception as e:
+        logger.warning("watchdog error: %s", e)
+
 def start_jobs():
     sched.add_job(heartbeat, "interval", seconds=HEARTBEAT_SEC, id="heartbeat", replace_existing=True)
     poll_secs = getattr(engine, "poll_seconds", 60)
     sched.add_job(trading_cycle, "interval", seconds=poll_secs, id="trading_cycle", replace_existing=True)
     if SELF_URL:
         sched.add_job(keepalive, "interval", seconds=300, id="keepalive", replace_existing=True)
+    # watchdog every 2 minutes
+    sched.add_job(webhook_watchdog, "interval", seconds=120, id="wh_watchdog", replace_existing=True)
 
     if not sched.running:
         sched.start()
@@ -112,7 +149,8 @@ def _get_wh_info():
     try:
         r = requests.get(f"https://api.telegram.org/bot{TOKEN}/getWebhookInfo", timeout=10)
         return r.json()
-    except Exception:
+    except Exception as e:
+        logger.warning("getWebhookInfo error: %s", e)
         return {}
 
 @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=1, max=30))
@@ -143,7 +181,7 @@ def root():
 def healthz():
     return Response("healthy", status=200)
 
-# Self-test endpoint for Render
+# Self-test endpoint (server-side injection to webhook)
 @app.route("/__selftest", methods=["POST"])
 def __selftest():
     data = request.get_json(silent=True) or {}
@@ -176,20 +214,24 @@ def _events_text(limit: int = 15) -> str:
         lines.append(f"{ts} | {kind} | {rest}")
     return "\n".join(lines)
 
+def _pretty(obj, maxlen=1500):
+    try:
+        txt = json.dumps(obj, indent=2, ensure_ascii=False)
+        return txt if len(txt) <= maxlen else txt[:maxlen] + "\n…[truncated]"
+    except Exception:
+        return str(obj)
+
 # ===== TELEGRAM WEBHOOK =====
 @app.route("/webhook", methods=["POST"])
 def webhook():
+    global LAST_WEBHOOK_AT
+    LAST_WEBHOOK_AT = _now_utc()
     try:
-        logger.info("Webhook headers: %s", dict(request.headers))
+        logger.info("Webhook hit at %s", LAST_WEBHOOK_AT.isoformat(timespec="seconds"))
     except Exception:
         pass
 
     update = request.get_json(silent=True) or {}
-    try:
-        logger.info("Webhook payload keys: %s", list(update.keys()))
-    except Exception:
-        pass
-
     msg = update.get("message") or update.get("edited_message") or {}
     text = (msg.get("text") or "").strip()
     chat_id = str((msg.get("chat") or {}).get("id") or "") or ADMIN_CHAT_ID
@@ -211,13 +253,14 @@ def webhook():
             "/positions – open positions\n"
             "/pnl – running PnL\n"
             "/cycle – run one immediate tick\n"
-            "/buy <addr> – mock/live buy\n"
-            "/sell <addr> – mock/live sell\n"
-            "/seteth <addr> – set tracked ETH token\n"
-            "/setbsc <addr> – set tracked BSC token\n"
-            "/mode mock|live – switch mode\n"
-            "/pause /resume – control engine\n"
-            "/log – last events"
+            "/buy <addr> /sell <addr>\n"
+            "/seteth <addr> /setbsc <addr>\n"
+            "/mode mock|live /pause /resume\n"
+            "/log – last events\n"
+            "/debugwebhook – webhook info\n"
+            "/forcewebhook – re-register webhook\n"
+            "/setalert <chat_id> – move alerts\n"
+            "/echo <text> – test round-trip"
         )
         try:
             if hasattr(engine, "status_text"):
@@ -230,7 +273,6 @@ def webhook():
         try:
             tg_send(chat_id, engine.status_text() if hasattr(engine, "status_text") else "status_text() missing")
         except Exception as e:
-            logger.exception("status")
             tg_send(chat_id, f"Status error: {e}")
         return Response("ok", status=200)
 
@@ -243,7 +285,6 @@ def webhook():
             else:
                 tg_send(chat_id, "Usage: /mode mock|live")
         except Exception as e:
-            logger.exception("mode")
             tg_send(chat_id, f"Mode error: {e}")
         return Response("ok", status=200)
 
@@ -252,7 +293,6 @@ def webhook():
             engine.pause() if hasattr(engine, "pause") else None
             tg_send(chat_id, "Engine paused")
         except Exception as e:
-            logger.exception("pause")
             tg_send(chat_id, f"Pause error: {e}")
         return Response("ok", status=200)
 
@@ -261,7 +301,6 @@ def webhook():
             engine.resume() if hasattr(engine, "resume") else None
             tg_send(chat_id, "Engine resumed")
         except Exception as e:
-            logger.exception("resume")
             tg_send(chat_id, f"Resume error: {e}")
         return Response("ok", status=200)
 
@@ -271,7 +310,6 @@ def webhook():
             engine.set_token("ETH", addr)
             tg_send(chat_id, f"ETH token set to {addr}")
         except Exception as e:
-            logger.exception("seteth")
             tg_send(chat_id, f"seteth error: {e}")
         return Response("ok", status=200)
 
@@ -281,7 +319,6 @@ def webhook():
             engine.set_token("BSC", addr)
             tg_send(chat_id, f"BSC token set to {addr}")
         except Exception as e:
-            logger.exception("setbsc")
             tg_send(chat_id, f"setbsc error: {e}")
         return Response("ok", status=200)
 
@@ -291,7 +328,6 @@ def webhook():
             res = engine.manual_buy(token) if hasattr(engine, "manual_buy") else "manual_buy() missing"
             tg_send(chat_id, res or "Buy attempted.")
         except Exception as e:
-            logger.exception("buy")
             tg_send(chat_id, f"Buy error: {e}")
         return Response("ok", status=200)
 
@@ -301,7 +337,6 @@ def webhook():
             res = engine.manual_sell(token) if hasattr(engine, "manual_sell") else "manual_sell() missing"
             tg_send(chat_id, res or "Sell attempted.")
         except Exception as e:
-            logger.exception("sell")
             tg_send(chat_id, f"Sell error: {e}")
         return Response("ok", status=200)
 
@@ -320,7 +355,6 @@ def webhook():
                     pos.append(f"{p['chain']} {p['token']} qty={p['qty']:.6f} avg={p['avg_price']}")
             tg_send(chat_id, "No positions." if not pos else "📦 Positions:\n" + "\n".join(pos))
         except Exception as e:
-            logger.exception("positions")
             tg_send(chat_id, f"Positions error: {e}")
         return Response("ok", status=200)
 
@@ -330,7 +364,6 @@ def webhook():
             count = len(getattr(engine, "positions", {}) or {})
             tg_send(chat_id, f"💰 PnL≈${pnl:.2f} | positions={count}")
         except Exception as e:
-            logger.exception("pnl")
             tg_send(chat_id, f"PnL error: {e}")
         return Response("ok", status=200)
 
@@ -339,7 +372,6 @@ def webhook():
             engine.run_cycle() if hasattr(engine, "run_cycle") else None
             tg_send(chat_id, "🔁 Ran one cycle.")
         except Exception as e:
-            logger.exception("cycle-now")
             tg_send(chat_id, f"Cycle error: {e}")
         return Response("ok", status=200)
 
@@ -347,8 +379,38 @@ def webhook():
         try:
             tg_send(chat_id, _events_text(20))
         except Exception as e:
-            logger.exception("log")
             tg_send(chat_id, f"log error: {e}")
+        return Response("ok", status=200)
+
+    if low.startswith("/debugwebhook"):
+        info = _get_wh_info()
+        last = LAST_WEBHOOK_AT.isoformat(timespec="seconds") if LAST_WEBHOOK_AT else "never"
+        tg_send(chat_id, f"Webhook info:\n{_pretty(info)}\n\nlast_webhook_at={last}")
+        return Response("ok", status=200)
+
+    if low.startswith("/forcewebhook"):
+        try:
+            ensure_webhook()
+            tg_send(chat_id, "✅ Webhook re-registered.")
+        except Exception as e:
+            tg_send(chat_id, f"forcewebhook error: {e}")
+        return Response("ok", status=200)
+
+    if low.startswith("/setalert"):
+        try:
+            new_id = (text.split(" ", 1)[1] or "").strip()
+            if not new_id:
+                tg_send(chat_id, "Usage: /setalert <chat_id>")
+            else:
+                _set_alert_chat(new_id)
+                tg_send(chat_id, f"Alerts now going to {new_id}")
+        except Exception as e:
+            tg_send(chat_id, f"setalert error: {e}")
+        return Response("ok", status=200)
+
+    if low.startswith("/echo"):
+        payload = text.split(" ", 1)[1] if " " in text else "(empty)"
+        tg_send(chat_id, f"echo: {payload}")
         return Response("ok", status=200)
 
     if low.startswith("/ping"):
@@ -361,7 +423,8 @@ def webhook():
         "/start /status /mode mock|live /pause /resume\n"
         "/seteth <addr> /setbsc <addr>\n"
         "/price /positions /pnl /cycle /log\n"
-        "/buy <addr> /sell <addr> /ping"
+        "/debugwebhook /forcewebhook /setalert <chat_id>\n"
+        "/buy <addr> /sell <addr> /echo <text> /ping"
     )
     return Response("ok", status=200)
 
@@ -388,7 +451,6 @@ def boot():
         except Exception as e:
             logger.warning("Auto resume failed: %s", e)
 
-# Run boot at import (works under gunicorn -w 1)
 boot()
 
 if __name__ == "__main__":
