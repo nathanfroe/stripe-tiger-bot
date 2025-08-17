@@ -6,6 +6,8 @@ from datetime import datetime
 from loguru import logger
 from web3 import Web3
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from dex_executor import DexExecutor
 
@@ -41,7 +43,7 @@ SMA_FAST = int(os.getenv("SMA_FAST", "20"))
 SMA_SLOW = int(os.getenv("SMA_SLOW", "50"))
 
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") or os.getenv("ADMIN_CHAT_ID")
-ALERT_CHAT_ID = os.getenv("ALERT_CHAT_ID") or TELEGRAM_CHAT_ID  # added: fallback if provided
+ALERT_CHAT_ID = os.getenv("ALERT_CHAT_ID") or TELEGRAM_CHAT_ID  # fallback
 
 # Auto-tune controls
 AUTO_TUNE = os.getenv("AUTO_TUNE", "true").lower() == "true"
@@ -54,6 +56,28 @@ AI_BUY_Q   = float(os.getenv("AI_BUY_Q",  "0.65"))
 AI_SELL_Q  = float(os.getenv("AI_SELL_Q", "0.35"))
 RSI_BUY_Q  = float(os.getenv("RSI_BUY_Q", "0.60"))
 RSI_SELL_Q = float(os.getenv("RSI_SELL_Q","0.40"))
+
+# Risk controls (optional)
+STOP_LOSS_PCT    = float(os.getenv("STOP_LOSS_PCT", "0.0"))   # 0 -> disabled
+TAKE_PROFIT_PCT  = float(os.getenv("TAKE_PROFIT_PCT", "0.0")) # 0 -> disabled
+
+# “thinking” log cadence
+THINK_EVERY = int(os.getenv("THINK_EVERY", "20"))
+
+# ================= HTTP session with retries =================
+def _make_session() -> requests.Session:
+    s = requests.Session()
+    retry = Retry(
+        total=3, read=3, connect=3,
+        backoff_factor=0.4, status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=["GET", "POST"]
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    return s
+
+_http = _make_session()
 
 # ================= Data structs =================
 @dataclass
@@ -128,14 +152,25 @@ def _quantile(values: List[float], q: float) -> Optional[float]:
     idx = max(0, min(len(v) - 1, int(q * (len(v) - 1))))
     return v[idx]
 
+def _get_json(url: str, timeout: float = 10.0) -> Optional[dict]:
+    try:
+        r = _http.get(url, timeout=timeout)
+        if r.status_code == 200:
+            return r.json()
+    except Exception:
+        pass
+    return None
+
 def _best_dexscreener_pair_usd(token_addr: str, chain: str) -> Tuple[Optional[float], Optional[float]]:
     """(price_usd, liquidity_usd) for most liquid pair of token on chain."""
+    data = _get_json(f"https://api.dexscreener.com/latest/dex/tokens/{token_addr}")
+    if not data:
+        return None, None
     try:
-        r = requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{token_addr}", timeout=10)
-        data = r.json().get("pairs", [])
+        pairs = data.get("pairs", [])
         target = "ethereum" if chain == "ETH" else "bsc"
         best = max(
-            (p for p in data if p.get("chainId") == target),
+            (p for p in pairs if p.get("chainId") == target),
             key=lambda x: float(x.get("liquidity", {}).get("usd", 0)),
             default=None,
         )
@@ -148,10 +183,10 @@ def _best_dexscreener_pair_usd(token_addr: str, chain: str) -> Tuple[Optional[fl
         return None, None
 
 def _base_price_usd(chain: str) -> Optional[float]:
+    ids = "ethereum" if chain == "ETH" else "binancecoin"
+    data = _get_json(f"https://api.coingecko.com/api/v3/simple/price?ids={ids}&vs_currencies=usd")
     try:
-        ids = "ethereum" if chain == "ETH" else "binancecoin"
-        r = requests.get(f"https://api.coingecko.com/api/v3/simple/price?ids={ids}&vs_currencies=usd", timeout=10)
-        return float(r.json().get(ids, {}).get("usd", 0)) or None
+        return float(data.get(ids, {}).get("usd", 0)) or None if data else None
     except Exception:
         return None
 
@@ -191,11 +226,11 @@ class TradeMachine:
         # cycle counter
         self._cycle = 0
 
-        # ====== ADDED: optional hooks ======
-        self.log_event_cb = None  # bot.py may set: engine.log_event_cb = log_event
+        # optional hooks
+        self.log_event_cb = None
         self._alert_chat_id = ALERT_CHAT_ID or TELEGRAM_CHAT_ID
 
-        # ====== ADDED: startup logs (masked) ======
+        # ===== startup logs (masked) =====
         def _mask(addr: Optional[str]) -> str:
             if not addr or len(addr) < 10:
                 return "MISSING"
@@ -206,7 +241,6 @@ class TradeMachine:
             self.mode, self.poll_seconds, _mask(ETH_TOKEN_ADDRESS), _mask(BSC_TOKEN_ADDRESS),
             "yes" if RPC_URL_ETH else "no", "yes" if RPC_URL_BSC else "no", AUTO_TUNE
         )
-        # ====== ADDED: announce ready to Telegram ======
         try:
             self._notify(
                 f"🤖 Engine ready\n"
@@ -233,7 +267,6 @@ class TradeMachine:
         self._notify("▶️ Engine resumed")
 
     def set_sender(self, cb):
-        """Optional setter if caller wants to re-wire Telegram sender at runtime."""
         try:
             if callable(cb):
                 self.tg = cb
@@ -243,6 +276,17 @@ class TradeMachine:
 
     def short_status(self):
         return f"mode={self.mode} paused={self.paused} positions={len(self.positions)} pnl≈{self.pnl_usd:.2f}"
+
+    def positions_text(self) -> str:
+        if not self.positions:
+            return "No positions."
+        lines = ["Positions:"]
+        for t, p in self.positions.items():
+            lines.append(f"• {t} ({p.chain}): qty={p.qty:.6f} avg=${p.avg:.6f}")
+        return "\n".join(lines)
+
+    def pnl_text(self) -> str:
+        return f"PnL (mock running): ${self.pnl_usd:.2f}"
 
     def status_text(self):
         lines = [
@@ -255,6 +299,7 @@ class TradeMachine:
             f"AI tuned (buy/sell): {dict(self._ai_pairs())}",
             f"RSI tuned (buy/sell): {dict(self._rsi_pairs())}",
             f"AUTO_TUNE={AUTO_TUNE} | WARMUP={TUNE_WARMUP} | EVERY={TUNE_EVERY} | LOCK_TUNED={LOCK_TUNED}",
+            f"Risk: stop_loss={STOP_LOSS_PCT} take_profit={TAKE_PROFIT_PCT}",
         ]
         return "\n".join(lines)
 
@@ -266,9 +311,7 @@ class TradeMachine:
         for token in list(self.tuned_rsi_buy.keys()):
             yield (token, (round(self.tuned_rsi_buy[token],1), round(self.tuned_rsi_sell[token],1)))
 
-    # ====== ADDED: simple accessor ======
     def get_positions(self):
-        """Return positions as a list of dicts for chat/debug/dashboard."""
         out = []
         for token, pos in (self.positions or {}).items():
             out.append({
@@ -279,9 +322,7 @@ class TradeMachine:
             })
         return out
 
-    # ====== ADDED: event recorder hook ======
     def _record(self, kind: str, **kw):
-        """If a callback is attached (via bot.py), write structured events; otherwise no-op."""
         try:
             cb = getattr(self, "log_event_cb", None)
             if callable(cb):
@@ -289,7 +330,7 @@ class TradeMachine:
         except Exception:
             pass
 
-    # ----- manual commands (token is a 0x address) -----
+    # ----- manual commands -----
     def manual_buy(self, token: str) -> str:
         chain = self._infer_chain(token)
         return self._execute(chain, "buy", token, ALLOCATION_USD)
@@ -312,7 +353,7 @@ class TradeMachine:
 
         for chain, token in tasks:
             try:
-                # 1) Pull latest price & liquidity
+                # 1) price & liq
                 price, liq = _best_dexscreener_pair_usd(token, chain)
                 if price is None or liq is None:
                     self._notify(f"⚠️ No price/liquidity for {token} on {chain}")
@@ -323,12 +364,11 @@ class TradeMachine:
                     self._record("warn", token=token, chain=chain, liq=liq, note="low liq")
                     continue
 
-                # 2) Update indicators
+                # 2) indicators
                 pw = self.history[token]
                 prev = pw.prices[-1] if pw.prices else None
                 pw.add(price)
 
-                # AI score update from simple return
                 if prev:
                     ret = (price - prev) / prev
                     self.ai[token].update(ret)
@@ -338,23 +378,36 @@ class TradeMachine:
                 rsi = pw.rsi()
                 ai_p = self.ai[token].prob_up()
 
-                # periodic “thinking” log to Telegram (every 20 cycles)
-                if self._cycle % 20 == 0:
+                if THINK_EVERY > 0 and self._cycle % THINK_EVERY == 0:
                     self._notify(
                         f"🧠 {token} {chain} | p=${(price or 0):.6f} | "
                         f"SMA{SMA_FAST}/{SMA_SLOW}={(s_fast or 0):.6f}/{(s_slow or 0):.6f} "
                         f"| RSI={(rsi or 0):.2f} | AI={ai_p:.2f}"
                     )
 
-                # 3) Optional: Auto-tune from distributions
+                # 3) autotune
                 if AUTO_TUNE and not LOCK_TUNED:
                     self._maybe_autotune(token)
 
-                # 4) Decide using tuned thresholds (fallback to baseline if not tuned)
+                # 4) thresholds
                 ai_buy  = self.tuned_ai_buy[token]
                 ai_sell = self.tuned_ai_sell[token]
                 rsi_b   = self.tuned_rsi_buy[token]
                 rsi_s   = self.tuned_rsi_sell[token]
+
+                # Risk checks (if in position)
+                pos = self.positions.get(token)
+                if pos and pos.qty > 0 and price:
+                    if STOP_LOSS_PCT > 0 and price <= pos.avg * (1 - STOP_LOSS_PCT):
+                        res = self._execute(chain, "sell", token, ALLOCATION_USD)
+                        self._notify(f"🛑 STOP-LOSS hit for {token} {chain} | p=${price:.6f} <= {pos.avg*(1-STOP_LOSS_PCT):.6f}\n{res}")
+                        self._record("risk_exit", token=token, chain=chain, reason="stop_loss", price=price)
+                        continue
+                    if TAKE_PROFIT_PCT > 0 and price >= pos.avg * (1 + TAKE_PROFIT_PCT):
+                        res = self._execute(chain, "sell", token, ALLOCATION_USD)
+                        self._notify(f"🎯 TAKE-PROFIT hit for {token} {chain} | p=${price:.6f} ≥ {pos.avg*(1+TAKE_PROFIT_PCT):.6f}\n{res}")
+                        self._record("risk_exit", token=token, chain=chain, reason="take_profit", price=price)
+                        continue
 
                 if s_fast and s_slow and rsi:
                     want_buy  = (s_fast > s_slow) and (rsi >= rsi_b) and (ai_p >= ai_buy)
@@ -362,12 +415,21 @@ class TradeMachine:
 
                     if want_buy:
                         res = self._execute(chain, "buy", token, ALLOCATION_USD)
-                        self._notify(f"🟢 BUY {token} {chain} | p=${price:.6f} | SMA {SMA_FAST}/{SMA_SLOW}={s_fast:.6f}/{s_slow:.6f} | RSI={rsi:.2f}≥{rsi_b:.2f} | AI={ai_p:.2f}≥{ai_buy:.2f}\n{res}")
+                        self._notify(
+                            f"🟢 BUY {token} {chain} | p=${price:.6f} | "
+                            f"SMA {SMA_FAST}/{SMA_SLOW}={s_fast:.6f}/{s_slow:.6f} | "
+                            f"RSI={rsi:.2f}≥{rsi_b:.2f} | AI={ai_p:.2f}≥{ai_buy:.2f}\n{res}"
+                        )
                         self._record("signal", token=token, chain=chain, side="buy", price=price,
                                      rsi=rsi, ai=ai_p, s_fast=s_fast, s_slow=s_slow)
+
                     elif want_sell:
                         res = self._execute(chain, "sell", token, ALLOCATION_USD)
-                        self._notify(f"🔴 SELL {token} {chain} | p=${price:.6f} | SMA {SMA_FAST}/{SMA_SLOW}={s_fast:.6f}/{s_slow:.6f} | RSI={rsi:.2f}≤{rsi_s:.2f} | AI={ai_p:.2f}≤{ai_sell:.2f}\n{res}")
+                        self._notify(
+                            f"🔴 SELL {token} {chain} | p=${price:.6f} | "
+                            f"SMA {SMA_FAST}/{SMA_SLOW}={s_fast:.6f}/{s_slow:.6f} | "
+                            f"RSI={rsi:.2f}≤{rsi_s:.2f} | AI={ai_p:.2f}≤{ai_sell:.2f}\n{res}"
+                        )
                         self._record("signal", token=token, chain=chain, side="sell", price=price,
                                      rsi=rsi, ai=ai_p, s_fast=s_fast, s_slow=s_slow)
 
@@ -384,14 +446,10 @@ class TradeMachine:
         if self._cycle % TUNE_EVERY != 0:
             return
 
-        # Collect recent RSI + AI scores
         rsi_vals = []
-        # Compute RSIs across the history (approx: sample last N)
         snapshot = list(pw.prices)[-max(2*TUNE_WARMUP, 200):]
         tmp_pw = PriceWindow(rsi_len=14, maxlen=len(snapshot)+5)
-        prev = None
         for p in snapshot:
-            prev = tmp_pw.prices[-1] if tmp_pw.prices else None
             tmp_pw.add(p)
             r = tmp_pw.rsi()
             if r is not None:
@@ -399,12 +457,10 @@ class TradeMachine:
 
         ai_vals = list(self.ai[token].history)[-max(2*TUNE_WARMUP, 200):]
 
-        # Only tune if we have enough samples
         if len(ai_vals) >= TUNE_WARMUP:
             ai_buy_q  = _quantile(ai_vals, AI_BUY_Q)
             ai_sell_q = _quantile(ai_vals, AI_SELL_Q)
             if ai_buy_q is not None and ai_sell_q is not None:
-                # Keep a safety margin so buy >= sell + 0.05
                 if ai_buy_q < ai_sell_q + 0.05:
                     ai_buy_q = min(0.95, ai_sell_q + 0.05)
                 self.tuned_ai_buy[token]  = round(float(ai_buy_q), 4)
@@ -414,24 +470,22 @@ class TradeMachine:
             rsi_buy_q  = _quantile(rsi_vals, RSI_BUY_Q)
             rsi_sell_q = _quantile(rsi_vals, RSI_SELL_Q)
             if rsi_buy_q is not None and rsi_sell_q is not None:
-                # Safety margin so buy >= sell + 5
                 if rsi_buy_q < rsi_sell_q + 5:
                     rsi_buy_q = min(90.0, rsi_sell_q + 5)
                 self.tuned_rsi_buy[token]  = round(float(rsi_buy_q), 2)
                 self.tuned_rsi_sell[token] = round(float(rsi_sell_q), 2)
 
-        self._notify(f"🔧 Auto-tuned {token}: AI(buy/sell)={self.tuned_ai_buy[token]:.2f}/{self.tuned_ai_sell[token]:.2f} | "
-                     f"RSI(buy/sell)={self.tuned_rsi_buy[token]:.1f}/{self.tuned_rsi_sell[token]:.1f}")
+        self._notify(
+            f"🔧 Auto-tuned {token}: AI(buy/sell)={self.tuned_ai_buy[token]:.2f}/{self.tuned_ai_sell[token]:.2f} | "
+            f"RSI(buy/sell)={self.tuned_rsi_buy[token]:.1f}/{self.tuned_rsi_sell[token]:.1f}"
+        )
 
     # ----- core exec -----
     def _execute(self, chain: str, side: str, token_addr: str, usd_amount: float) -> str:
         if self.mode == "mock":
-            # Paper fill & PnL bookkeeping
             price, _ = _best_dexscreener_pair_usd(token_addr, chain)
             if not price:
                 return "[MOCK] no price"
-
-            # record submit (mock)
             self._record("order_submitted", token=token_addr, chain=chain, side=side, price=price, usd=usd_amount, tx=None)
 
             pos = self.positions.get(token_addr, Position(qty=0.0, avg=0.0, chain=chain))
@@ -441,10 +495,7 @@ class TradeMachine:
                 pos.avg = (pos.avg * pos.qty + usd_amount) / new_qty if new_qty > 0 else price
                 pos.qty = new_qty
                 self.positions[token_addr] = pos
-
-                # record fill (mock)
                 self._record("fill", token=token_addr, chain=chain, side="buy", qty=units, price=price, tx=None)
-
             else:
                 if pos.qty <= 0:
                     return "[MOCK] no position to sell"
@@ -454,13 +505,11 @@ class TradeMachine:
                 if pos.qty == 0:
                     pos.avg = 0.0
                 self.positions[token_addr] = pos
-
-                # record fill (mock)
                 self._record("fill", token=token_addr, chain=chain, side="sell", qty=units, price=price, tx=None)
 
-            return f"[MOCK] {side.upper()} {token_addr} on {chain} for ~${usd_amount:.2f} | pos={pos.qty:.6f}@{pos.avg:.6f} | PnL≈${self.pnl_usd:.2f}"
+            return f"[MOCK] {side.UPPER()} {token_addr} on {chain} for ~${usd_amount:.2f} | pos={pos.qty:.6f}@{pos.avg:.6f} | PnL≈${self.pnl_usd:.2f}"
 
-        # LIVE mode
+        # LIVE
         if EXECUTION_MODE != "DEX":
             return f"⚠️ Unsupported EXECUTION_MODE={EXECUTION_MODE}"
 
@@ -475,13 +524,8 @@ class TradeMachine:
             else:
                 txh = self.dex.sell(chain, token_addr, usd_amount)
 
-            # record submit (live)
             self._record("order_submitted", token=token_addr, chain=chain, side=side, price=base_price, usd=usd_amount, tx=txh)
             self._notify(f"📝 LIVE {side.upper()} {token_addr} ({chain}) tx={txh}")
-
-            # If you later detect confirmation, also call:
-            # self._record("fill", token=token_addr, chain=chain, side=side, price=fill_price, tx=txh)
-
             return f"[LIVE] {side.upper()} {token_addr} on {chain} ~${usd_amount:.2f} | tx={txh}"
         except Exception as e:
             logger.exception("live exec failed")
@@ -490,11 +534,6 @@ class TradeMachine:
 
     # ----- utilities -----
     def _notify(self, text: str):
-        """
-        Prefer the injected tg_sender (from bot.py). If not present, fall back to
-        the original direct HTTP send using TELEGRAM_BOT_TOKEN and chat id.
-        """
-        # Preferred: callback
         try:
             target = self._alert_chat_id or TELEGRAM_CHAT_ID
             if getattr(self, "tg", None) and target:
@@ -502,12 +541,10 @@ class TradeMachine:
                 return
         except Exception:
             pass
-
-        # Fallback: direct HTTP
         if TELEGRAM_CHAT_ID:
             try:
                 token = os.getenv("TELEGRAM_BOT_TOKEN")
-                requests.post(
+                _http.post(
                     f"https://api.telegram.org/bot{token}/sendMessage",
                     json={"chat_id": TELEGRAM_CHAT_ID, "text": text},
                     timeout=10,
