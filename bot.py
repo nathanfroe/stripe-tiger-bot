@@ -1,6 +1,10 @@
-# bot.py — instrumented webhook, safe sending, manual/auto polling fallback, rich commands
+# bot.py — webhook-first Telegram bot with APScheduler, safe watchdog,
+# and a full command set wired into TradeMachine.
 
-import os, json, logging, time
+import os
+import json
+import time
+import logging
 from datetime import datetime, timezone as dt_tz
 
 import requests
@@ -8,71 +12,156 @@ from flask import Flask, request, Response
 from apscheduler.schedulers.background import BackgroundScheduler
 from tenacity import retry, stop_after_attempt, wait_exponential
 
-# ========= ENV =========
+# ===================== ENV =====================
 TOKEN         = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ADMIN_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") or os.getenv("ADMIN_CHAT_ID", "")
 ALERT_CHAT_ID = os.getenv("ALERT_CHAT_ID", ADMIN_CHAT_ID)
-WEBHOOK_URL   = os.getenv("WEBHOOK_URL", "")
-SELF_URL      = os.getenv("SELF_URL", "")
-PORT          = int(os.getenv("PORT", "10000"))
+SELF_URL      = os.getenv("SELF_URL", "")  # https://your-app.onrender.com
+WEBHOOK_URL   = os.getenv("WEBHOOK_URL", "")  # https://your-app.onrender.com/webhook
 TZ_NAME       = os.getenv("TIMEZONE", "UTC")
-HEARTBEAT_SEC = int(os.getenv("HEARTBEAT_INTERVAL", "900"))
+
+HEARTBEAT_SEC = int(os.getenv("HEARTBEAT_INTERVAL", "900"))  # 15m
+PORT          = int(os.getenv("PORT", "10000"))
 AUTO_START    = os.getenv("AUTO_START", "true").lower() == "true"
 
-# Fallback & diagnostics
-WATCHDOG_GRACE_SEC = int(os.getenv("WEBHOOK_WATCHDOG_SEC", "300"))  # 5 min
-POLL_BURST_SECONDS = int(os.getenv("POLL_BURST_SECONDS", "45"))     # 45s
-POLL_INTERVAL_SEC  = int(os.getenv("POLL_INTERVAL_SEC", "2"))       # 2s
+# Watchdog (keeps talking if webhook is quiet, which you said you like)
+WD_CHECK_EVERY  = int(os.getenv("WD_CHECK_EVERY", "120"))   # check every 2m
+WD_QUIET_LIMIT  = int(os.getenv("WD_QUIET_LIMIT", "180"))   # if no hits for 3m => do a short polling burst
+POLL_BURST_SEC  = int(os.getenv("POLL_BURST_SEC", "15"))    # seconds to burst poll
+POLL_INTERVAL_S = int(os.getenv("POLL_INTERVAL_S", "2"))    # frequency of getUpdates during burst
 
-# ========= LOGGING =========
-logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
+# ===================== LOGGING =====================
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    level=logging.INFO,
+)
 logger = logging.getLogger("bot")
 
-def now_utc(): return datetime.now(dt_tz.utc)
-
-# ========= Telegram helpers =========
-def _api(method: str, **params):
-    r = requests.get(f"https://api.telegram.org/bot{TOKEN}/{method}", params=params, timeout=20)
-    if r.status_code != 200:
-        raise RuntimeError(f"{method} failed: {r.status_code} | {r.text}")
-    return r.json()
-
+# ===================== Telegram send helper =====================
 def tg_send(chat_id: str, text: str):
-    """Always attempt; if Telegram rejects, echo error back to ADMIN/ALERT."""
-    if not TOKEN or not chat_id: return
+    if not TOKEN or not chat_id:
+        return
     try:
-        if text and len(text) > 3900:
-            text = text[:3900] + "\n…[truncated]"
         r = requests.post(
             f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-            json={"chat_id": str(chat_id), "text": text},
-            timeout=20,
+            json={"chat_id": chat_id, "text": text},
+            timeout=12,
         )
         if r.status_code != 200:
-            err = f"sendMessage failed: {r.status_code} | {r.text}"
-            logger.error(err)
-            if ALERT_CHAT_ID:
-                try:
-                    requests.post(
-                        f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-                        json={"chat_id": str(ALERT_CHAT_ID), "text": f"⚠️ {err}"},
-                        timeout=15,
-                    )
-                except Exception:
-                    logger.exception("Secondary alert send failed")
-    except Exception:
-        logger.exception("tg_send exception")
-
-def get_webhook_info():
-    try:
-        return _api("getWebhookInfo")
+            logger.error("sendMessage failed: %s | body=%s", r.status_code, r.text)
     except Exception as e:
-        logger.warning("getWebhookInfo error: %s", e); return {}
+        logger.exception("Telegram send error: %s", e)
+
+# ===================== ENGINE =====================
+from trademachine import (
+    TradeMachine,
+    _best_dexscreener_pair_usd,
+    ETH_TOKEN_ADDRESS,
+    BSC_TOKEN_ADDRESS,
+)
+
+engine = TradeMachine(tg_sender=tg_send)
+
+try:
+    if hasattr(engine, "set_sender"):
+        engine.set_sender(tg_send)
+        tg_send(ALERT_CHAT_ID, "🔌 Sender re-wired")
+except Exception as e:
+    logger.warning("Could not attach Telegram sender to engine: %s", e)
+
+# ===================== FLASK =====================
+app = Flask(__name__)
+
+# Track last webhook hit so the watchdog can “talk”
+_last_webhook_hit_ts = time.time()
+
+# ===================== SCHEDULER =====================
+sched = BackgroundScheduler(timezone=TZ_NAME)
+
+def heartbeat():
+    ts = datetime.now(dt_tz.utc).isoformat(timespec="seconds")
+    tg_send(ALERT_CHAT_ID, f"❤️ heartbeat {ts}")
+
+def trading_cycle():
+    try:
+        if hasattr(engine, "run_cycle"):
+            engine.run_cycle()
+        elif hasattr(engine, "run"):
+            engine.run()
+        else:
+            tg_send(ALERT_CHAT_ID, "⚠️ Engine missing run/run_cycle.")
+    except Exception as e:
+        logger.exception("Cycle error")
+        tg_send(ALERT_CHAT_ID, f"⚠️ Cycle error: {e}")
+
+def keepalive():
+    if not SELF_URL:
+        return
+    try:
+        requests.get(f"{SELF_URL}/healthz", timeout=8)
+        logger.info("Keepalive ping OK")
+    except Exception:
+        pass
+
+def poll_burst(seconds=POLL_BURST_SEC):
+    """Temporary getUpdates burst without touching webhook config."""
+    end = time.time() + max(5, int(seconds))
+    offset = None
+    warned = False
+    while time.time() < end:
+        try:
+            r = requests.get(
+                f"https://api.telegram.org/bot{TOKEN}/getUpdates",
+                params={"timeout": 1, **({"offset": offset} if offset else {})},
+                timeout=5,
+            )
+            data = r.json()
+            if not warned:
+                tg_send(ALERT_CHAT_ID, "🛟 No webhook hits — entering temporary polling burst.")
+                warned = True
+            if data.get("ok"):
+                for upd in data.get("result", []):
+                    offset = upd["update_id"] + 1
+                    # Re-feed the update to our webhook handler path
+                    with app.test_request_context("/webhook", method="POST", json=upd):
+                        webhook()
+        except Exception as e:
+            logger.warning("poll burst error: %s", e)
+        time.sleep(max(1, POLL_INTERVAL_S))
+    tg_send(ALERT_CHAT_ID, "🧩 Webhook restored after polling burst.")
+
+def webhook_watchdog():
+    # chatty watchdog that you asked to keep
+    quiet_for = time.time() - _last_webhook_hit_ts
+    if quiet_for >= WD_QUIET_LIMIT:
+        poll_burst(POLL_BURST_SEC)
+
+def start_jobs():
+    sched.add_job(heartbeat, "interval", seconds=HEARTBEAT_SEC, id="heartbeat", replace_existing=True)
+    poll_secs = getattr(engine, "poll_seconds", 60)
+    sched.add_job(trading_cycle, "interval", seconds=poll_secs, id="trading_cycle", replace_existing=True)
+    if SELF_URL:
+        sched.add_job(keepalive, "interval", seconds=300, id="keepalive", replace_existing=True)
+    # watchdog every WD_CHECK_EVERY
+    sched.add_job(webhook_watchdog, "interval", seconds=max(30, WD_CHECK_EVERY), id="webhook_watchdog", replace_existing=True)
+
+    if not sched.running:
+        sched.start()
+    logger.info("Scheduler started.")
+
+# ===================== WEBHOOK MGMT =====================
+def _get_wh_info():
+    try:
+        r = requests.get(f"https://api.telegram.org/bot{TOKEN}/getWebhookInfo", timeout=10)
+        return r.json()
+    except Exception:
+        return {}
 
 @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=1, max=30))
-def set_webhook():
+def ensure_webhook():
     if not TOKEN or not WEBHOOK_URL:
-        logger.warning("TOKEN/WEBHOOK_URL missing; skipping setWebhook"); return
+        logger.warning("TOKEN or WEBHOOK_URL missing; skipping setWebhook.")
+        return
     r = requests.get(
         f"https://api.telegram.org/bot{TOKEN}/setWebhook",
         params={
@@ -80,70 +169,66 @@ def set_webhook():
             "drop_pending_updates": True,
             "allowed_updates": json.dumps(["message", "edited_message"]),
         },
-        timeout=20,
+        timeout=15,
     )
     if r.status_code != 200:
-        raise RuntimeError(f"setWebhook failed: {r.status_code} | {r.text}")
-    logger.info("Webhook set OK: %s", get_webhook_info())
+        raise RuntimeError(f"setWebhook failed: {r.text}")
+    info = _get_wh_info()
+    logger.info("Webhook set OK. getWebhookInfo=%s", info)
 
-def delete_webhook():
-    try:
-        _api("deleteWebhook", drop_pending_updates=False)
-        logger.info("Webhook deleted")
-    except Exception as e:
-        logger.warning("deleteWebhook error: %s", e)
-
-# ========= ENGINE (mock-compatible) =========
-from trademachine import TradeMachine, _best_dexscreener_pair_usd
-engine = TradeMachine(tg_sender=tg_send)
-
-# ========= STATE =========
-BOOT_AT = now_utc()
-LAST_WEBHOOK_AT = None
-LAST_UPDATE_ID = None
-IS_IN_POLL_BURST = False
-
-# ========= FLASK =========
-app = Flask(__name__)
-
+# ===================== ROUTES =====================
 @app.route("/", methods=["GET"])
-def root(): return Response("OK", status=200)
+def root():
+    return Response("OK", status=200)
 
 @app.route("/healthz", methods=["GET"])
-def healthz(): return Response("healthy", status=200)
+def healthz():
+    return Response("healthy", status=200)
 
+# Self-test endpoint for Render/CLI
 @app.route("/__selftest", methods=["POST"])
 def __selftest():
     data = request.get_json(silent=True) or {}
-    fake = {"message": {"chat": {"id": data.get("chat_id", ADMIN_CHAT_ID)}, "text": data.get("text", "/ping")}}
+    fake = {
+        "message": {
+            "chat": {"id": data.get("chat_id", ADMIN_CHAT_ID)},
+            "text": data.get("text", "/ping"),
+        }
+    }
     with app.test_request_context("/webhook", method="POST", json=fake):
         return webhook()
 
-# ========= UTIL =========
-def fmt_price_line(chain: str, addr: str | None) -> str:
-    if not addr: return f"{chain}: (no token configured)"
+# util for /price
+def _fmt_price_line(chain: str, token_addr: str) -> str:
+    if not token_addr:
+        return f"{chain}: (no token configured)"
     try:
-        p, liq = _best_dexscreener_pair_usd(addr, chain)
-        if p is None or liq is None: return f"{chain}: {addr} → No price/liquidity"
-        return f"{chain}: {addr} → ${p:.6f} | liq≈${liq:,.0f}"
+        price, liq = _best_dexscreener_pair_usd(token_addr, chain)
+        if price is None or liq is None:
+            return f"{chain}: {token_addr} → No price/liquidity"
+        return f"{chain}: {token_addr} → ${price:.6f} | liq≈${liq:,.0f}"
     except Exception as e:
+        logger.exception("price fetch error")
         return f"{chain}: error: {e}"
 
-def events_text(n=20) -> str:
-    ev = getattr(engine, "events", [])[-n:]
-    if not ev: return "No recent events."
-    lines = ["🧾 Recent events:"]
-    for e in ev:
-        ts, kind = e.get("ts", ""), e.get("kind", "")
-        rest = {k: v for k, v in e.items() if k not in ("ts", "kind")}
-        lines.append(f"{ts} | {kind} | {rest}")
-    return "\n".join(lines)
+# ===================== TELEGRAM WEBHOOK =====================
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    global _last_webhook_hit_ts
+    _last_webhook_hit_ts = time.time()
 
-# ========= COMMANDS =========
-def handle_command(chat_id: str, text: str):
+    update = request.get_json(silent=True) or {}
+    msg = update.get("message") or update.get("edited_message") or {}
+    text = (msg.get("text") or "").strip()
+    chat_id = str((msg.get("chat") or {}).get("id") or "") or ADMIN_CHAT_ID
+
+    if not text:
+        return Response("no-text", status=200)
+
     low = text.lower()
 
-    if low.startswith(("/start", "/help", "/menu")):
+    # ------- Commands -------
+    if low.startswith("/start") or low.startswith("/help") or low == "/menu":
         tg_send(chat_id,
                 "🐯 Stripe Tiger bot is live.\n\n"
                 "Commands:\n"
@@ -152,236 +237,207 @@ def handle_command(chat_id: str, text: str):
                 "/seteth <addr> /setbsc <addr>\n"
                 "/mode mock|live /pause /resume\n"
                 "/diag /debugwebhook /forcewebhook /forcepoll /setalert <chat_id>\n"
-                "/echo <text> /ping"
-        )
+                "/echo <text> /ping")
         try:
             if hasattr(engine, "status_text"):
                 tg_send(chat_id, engine.status_text())
         except Exception:
             pass
-        return
+        return Response("ok", status=200)
 
     if low.startswith("/status"):
         try:
-            tg_send(chat_id, engine.status_text() if hasattr(engine, "status_text") else "status_text() missing")
+            tg_send(chat_id, engine.status_text())
         except Exception as e:
-            tg_send(chat_id, f"status error: {e}")
-        return
+            logger.exception("status")
+            tg_send(chat_id, f"Status error: {e}")
+        return Response("ok", status=200)
 
     if low.startswith("/mode"):
         parts = low.split()
-        if len(parts) == 2 and parts[1] in ("mock", "live"):
-            if hasattr(engine, "set_mode"): engine.set_mode(parts[1])
-            tg_send(chat_id, f"Mode set to {parts[1]}")
-        else:
-            tg_send(chat_id, "Usage: /mode mock|live")
-        return
+        try:
+            if len(parts) == 2 and parts[1] in ("mock", "live"):
+                if hasattr(engine, "set_mode"):
+                    engine.set_mode(parts[1])
+                    tg_send(chat_id, f"Mode set to {parts[1]}")
+                else:
+                    tg_send(chat_id, "set_mode() not implemented.")
+            else:
+                tg_send(chat_id, "Usage: /mode mock|live")
+        except Exception as e:
+            logger.exception("mode")
+            tg_send(chat_id, f"Mode error: {e}")
+        return Response("ok", status=200)
 
     if low.startswith("/pause"):
-        if hasattr(engine, "pause"): engine.pause()
-        tg_send(chat_id, "Engine paused"); return
+        try:
+            engine.pause()
+            tg_send(chat_id, "Engine paused")
+        except Exception as e:
+            logger.exception("pause")
+            tg_send(chat_id, f"Pause error: {e}")
+        return Response("ok", status=200)
 
     if low.startswith("/resume"):
-        if hasattr(engine, "resume"): engine.resume()
-        tg_send(chat_id, "Engine resumed"); return
+        try:
+            engine.resume()
+            tg_send(chat_id, "Engine resumed")
+        except Exception as e:
+            logger.exception("resume")
+            tg_send(chat_id, f"Resume error: {e}")
+        return Response("ok", status=200)
+
+    if low.startswith("/buy"):
+        token = text.split(" ", 1)[1].strip() if " " in text else ""
+        try:
+            res = engine.manual_buy(token or "")
+            tg_send(chat_id, res or "Buy attempted.")
+        except Exception as e:
+            logger.exception("buy")
+            tg_send(chat_id, f"Buy error: {e}")
+        return Response("ok", status=200)
+
+    if low.startswith("/sell"):
+        token = text.split(" ", 1)[1].strip() if " " in text else ""
+        try:
+            res = engine.manual_sell(token or "")
+            tg_send(chat_id, res or "Sell attempted.")
+        except Exception as e:
+            logger.exception("sell")
+            tg_send(chat_id, f"Sell error: {e}")
+        return Response("ok", status=200)
 
     if low.startswith("/seteth"):
         addr = text.split(" ", 1)[1].strip() if " " in text else ""
-        if hasattr(engine, "set_token"): engine.set_token("ETH", addr)
-        tg_send(chat_id, f"ETH token set to {addr}"); return
+        res = engine.set_eth_token(addr)
+        tg_send(chat_id, res)
+        return Response("ok", status=200)
 
     if low.startswith("/setbsc"):
         addr = text.split(" ", 1)[1].strip() if " " in text else ""
-        if hasattr(engine, "set_token"): engine.set_token("BSC", addr)
-        tg_send(chat_id, f"BSC token set to {addr}"); return
-
-    if low.startswith("/buy"):
-        addr = text.split(" ", 1)[1].strip() if " " in text else ""
-        res = engine.manual_buy(addr) if hasattr(engine, "manual_buy") else "manual_buy() missing"
-        tg_send(chat_id, res); return
-
-    if low.startswith("/sell"):
-        addr = text.split(" ", 1)[1].strip() if " " in text else ""
-        res = engine.manual_sell(addr) if hasattr(engine, "manual_sell") else "manual_sell() missing"
-        tg_send(chat_id, res); return
+        res = engine.set_bsc_token(addr)
+        tg_send(chat_id, res)
+        return Response("ok", status=200)
 
     if low.startswith("/price"):
-        tg_send(chat_id, "📈 Prices:\n" +
-               "\n".join([
-                   fmt_price_line("ETH", getattr(engine, "eth_token", None)),
-                   fmt_price_line("BSC", getattr(engine, "bsc_token", None))
-               ])); return
+        lines = ["📈 Prices (Dexscreener):"]
+        lines.append(_fmt_price_line("ETH", engine.eth_token or ETH_TOKEN_ADDRESS))
+        lines.append(_fmt_price_line("BSC", engine.bsc_token or BSC_TOKEN_ADDRESS))
+        tg_send(chat_id, "\n".join(lines))
+        return Response("ok", status=200)
 
     if low.startswith("/positions"):
-        pos = []
-        if hasattr(engine, "get_positions"):
-            for p in engine.get_positions():
-                pos.append(f"{p['chain']} {p['token']} qty={p['qty']:.6f} avg={p['avg_price']}")
-        tg_send(chat_id, "No positions." if not pos else "📦 Positions:\n" + "\n".join(pos)); return
+        try:
+            pos = engine.get_positions()
+            if not pos:
+                tg_send(chat_id, "No positions.")
+            else:
+                lines = ["📦 Positions:"]
+                for p in pos:
+                    lines.append(
+                        f"{p['chain']} | {p['token']} qty={p['qty']:.6f} "
+                        f"avg=${p['avg_price']:.6f} val≈${p['market_value']:.2f}"
+                    )
+                tg_send(chat_id, "\n".join(lines))
+        except Exception as e:
+            logger.exception("positions")
+            tg_send(chat_id, f"Positions error: {e}")
+        return Response("ok", status=200)
 
     if low.startswith("/pnl"):
-        pnl = getattr(engine, "pnl_usd", 0.0); cnt = len(getattr(engine, "positions", {}) or {})
-        tg_send(chat_id, f"💰 PnL≈${pnl:.2f} | positions={cnt}"); return
+        try:
+            pnl = getattr(engine, "pnl_usd", 0.0)
+            count = len(getattr(engine, "positions", {}) or {})
+            tg_send(chat_id, f"💰 PnL≈${pnl:.2f} | positions={count}")
+        except Exception as e:
+            logger.exception("pnl")
+            tg_send(chat_id, f"PnL error: {e}")
+        return Response("ok", status=200)
 
     if low.startswith("/cycle") or low.startswith("/think"):
-        if hasattr(engine, "run_cycle"): engine.run_cycle()
-        tg_send(chat_id, "🔁 Ran one cycle."); return
+        try:
+            engine.run_cycle()
+            tg_send(chat_id, "🔁 Ran one cycle.")
+        except Exception as e:
+            logger.exception("cycle-now")
+            tg_send(chat_id, f"Cycle error: {e}")
+        return Response("ok", status=200)
 
-    if low.startswith("/log"): tg_send(chat_id, events_text(20)); return
+    if low.startswith("/log"):
+        try:
+            tg_send(chat_id, engine.recent_events_text(12))
+        except Exception as e:
+            tg_send(chat_id, f"Log error: {e}")
+        return Response("ok", status=200)
 
-    if low.startswith("/debugwebhook"):
-        info = get_webhook_info()
-        last = LAST_WEBHOOK_AT.isoformat(timespec="seconds") if LAST_WEBHOOK_AT else "never"
-        boot = BOOT_AT.isoformat(timespec="seconds")
-        tg_send(chat_id, f"Webhook info:\n{json.dumps(info, indent=2)}\n\nboot_at={boot}\nlast_webhook_at={last}")
-        return
+    if low.startswith("/diag"):
+        tg_send(chat_id, json.dumps(_get_wh_info(), indent=2))
+        return Response("ok", status=200)
 
     if low.startswith("/forcewebhook"):
-        try: set_webhook(); tg_send(chat_id, "✅ Webhook re-registered.")
-        except Exception as e: tg_send(chat_id, f"forcewebhook error: {e}")
-        return
+        try:
+            ensure_webhook()
+            tg_send(chat_id, "Webhook forced/set.")
+        except Exception as e:
+            tg_send(chat_id, f"forcewebhook error: {e}")
+        return Response("ok", status=200)
+
+    if low.startswith("/debugwebhook"):
+        tg_send(chat_id, f"Last webhook hit {int(time.time()-_last_webhook_hit_ts)}s ago")
+        return Response("ok", status=200)
 
     if low.startswith("/forcepoll"):
-        # manually trigger a polling burst immediately
-        tg_send(chat_id, "⏬ Entering short polling burst now…")
-        try:
-            delete_webhook()
-            _poll_burst()
-            set_webhook()
-            tg_send(chat_id, "⏫ Webhook restored.")
-        except Exception as e:
-            tg_send(chat_id, f"forcepoll error: {e}")
-        return
+        poll_burst(POLL_BURST_SEC)
+        return Response("ok", status=200)
 
     if low.startswith("/setalert"):
-        new_id = (text.split(" ", 1)[1] or "").strip() if " " in text else ""
-        if new_id:
-            global ALERT_CHAT_ID
-            ALERT_CHAT_ID = new_id
-            tg_send(chat_id, f"Alerts → {new_id}")
+        arg = text.split(" ", 1)[1].strip() if " " in text else ""
+        if arg:
+            os.environ["ALERT_CHAT_ID"] = arg
+            tg_send(chat_id, f"ALERT_CHAT_ID set to {arg}")
         else:
             tg_send(chat_id, "Usage: /setalert <chat_id>")
-        return
+        return Response("ok", status=200)
 
-    if low.startswith("/echo"): payload = text.split(" ", 1)[1] if " " in text else "(empty)"; tg_send(chat_id, f"echo: {payload}"); return
-    if low.startswith("/ping"): tg_send(chat_id, "pong"); return
+    if low.startswith("/echo"):
+        tg_send(chat_id, text.split(" ", 1)[1] if " " in text else "(empty)")
+        return Response("ok", status=200)
 
-    tg_send(chat_id, "Unknown command. Try /help")
+    if low.startswith("/ping"):
+        tg_send(chat_id, "pong")
+        return Response("ok", status=200)
 
-# ========= WEBHOOK =========
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    """Log every update, process command, never silently ignore."""
-    global LAST_WEBHOOK_AT
-    LAST_WEBHOOK_AT = now_utc()
-
-    update = request.get_json(silent=True) or {}
-    msg = update.get("message") or update.get("edited_message") or {}
-    text = (msg.get("text") or "").strip()
-    chat_id = str((msg.get("chat") or {}).get("id") or "") or ADMIN_CHAT_ID
-
-    logger.info("WEBHOOK <- chat=%s text=%r", chat_id, text)
-    if ALERT_CHAT_ID and text:
-        # First-time observable proof the webhook is firing
-        pass  # (avoid spamming; logs above are enough)
-
-    if not text:
-        return Response("no-text", status=200)
-
-    try:
-        handle_command(chat_id, text)
-    except Exception as e:
-        logger.exception("command error")
-        tg_send(ALERT_CHAT_ID, f"⚠️ Command error: {e}")
+    # default help
+    tg_send(
+        chat_id,
+        "Commands:\n"
+        "/status /price /positions /pnl /cycle /log\n"
+        "/buy <addr> /sell <addr> /seteth <addr> /setbsc <addr>\n"
+        "/mode mock|live /pause /resume /diag /debugwebhook /forcewebhook /forcepoll\n"
+        "/setalert <chat_id> /echo <text> /ping"
+    )
     return Response("ok", status=200)
 
-# ========= POLLING BURST =========
-def _poll_burst():
-    global LAST_UPDATE_ID
-    t0 = time.time()
-    # prime offset to skip history
-    try:
-        primed = _api("getUpdates", timeout=0)
-        if primed.get("ok"):
-            for upd in primed.get("result", []):
-                LAST_UPDATE_ID = max(LAST_UPDATE_ID or 0, upd.get("update_id", 0))
-    except Exception as e:
-        logger.warning("prime getUpdates error: %s", e)
-
-    while time.time() - t0 < POLL_BURST_SECONDS:
-        try:
-            params = {"timeout": 0}
-            if LAST_UPDATE_ID is not None:
-                params["offset"] = LAST_UPDATE_ID + 1
-            resp = _api("getUpdates", **params)
-            if resp.get("ok") and resp.get("result"):
-                for upd in resp["result"]:
-                    LAST_UPDATE_ID = max(LAST_UPDATE_ID or 0, upd.get("update_id", 0))
-                    msg = upd.get("message") or upd.get("edited_message") or {}
-                    text = (msg.get("text") or "").strip()
-                    chat_id = str((msg.get("chat") or {}).get("id") or "") or ADMIN_CHAT_ID
-                    logger.info("POLL <- chat=%s text=%r", chat_id, text)
-                    if text:
-                        handle_command(chat_id, text)
-        except Exception as e:
-            logger.warning("getUpdates error: %s", e)
-        time.sleep(POLL_INTERVAL_SEC)
-
-# ========= SCHEDULER =========
-sched = BackgroundScheduler(timezone=TZ_NAME)
-
-def heartbeat():
-    tg_send(ALERT_CHAT_ID, f"❤️ heartbeat {now_utc().isoformat(timespec='seconds')}")
-
-def keepalive():
-    if SELF_URL:
-        try: requests.get(f"{SELF_URL}/healthz", timeout=8)
-        except Exception: pass
-
-def trading_cycle():
-    try:
-        if hasattr(engine, "run_cycle"):
-            engine.run_cycle()
-    except Exception as e:
-        logger.exception("cycle error")
-        tg_send(ALERT_CHAT_ID, f"⚠️ Cycle error: {e}")
-
-def webhook_watchdog():
-    """Auto rescue even if no webhook has *ever* arrived."""
-    silent_for = (now_utc() - (LAST_WEBHOOK_AT or BOOT_AT)).total_seconds()
-    if silent_for <= WATCHDOG_GRACE_SEC: return
-    tg_send(ALERT_CHAT_ID, "🛟 No webhook hits — entering temporary polling burst.")
-    try:
-        delete_webhook()
-        _poll_burst()
-        set_webhook()
-        tg_send(ALERT_CHAT_ID, "🔁 Webhook restored after polling burst.")
-    except Exception as e:
-        tg_send(ALERT_CHAT_ID, f"⚠️ Watchdog restore error: {e}")
-
-def start_jobs():
-    if not sched.running: sched.start()
-    sched.add_job(heartbeat, "interval", seconds=HEARTBEAT_SEC, id="heartbeat", replace_existing=True)
-    sched.add_job(trading_cycle, "interval", seconds=getattr(engine, "poll_seconds", 60), id="trading_cycle", replace_existing=True)
-    sched.add_job(webhook_watchdog, "interval", seconds=120, id="wh_watchdog", replace_existing=True)
-    if SELF_URL:
-        sched.add_job(keepalive, "interval", seconds=300, id="keepalive", replace_existing=True)
-    logger.info("Scheduler started.")
-
-# ========= BOOT =========
+# ===================== BOOT =====================
 def boot():
-    try: set_webhook()
-    except Exception as e: logger.warning("setWebhook failed at boot: %s", e)
+    try:
+        ensure_webhook()
+    except Exception as e:
+        logger.warning("Webhook not set: %s", e)
     start_jobs()
+
     try:
         if ADMIN_CHAT_ID:
             tg_send(ADMIN_CHAT_ID, "✅ Boot OK (service live)")
-            if hasattr(engine, "status_text"):
-                tg_send(ADMIN_CHAT_ID, engine.status_text())
-    except Exception: pass
-    if AUTO_START and hasattr(engine, "resume"):
-        try: engine.resume()
-        except Exception as e: logger.warning("auto resume failed: %s", e)
+            tg_send(ADMIN_CHAT_ID, engine.status_text())
+    except Exception:
+        pass
+
+    if AUTO_START:
+        try:
+            engine.resume()
+        except Exception as e:
+            logger.warning("Auto resume failed: %s", e)
 
 boot()
 
