@@ -1,5 +1,5 @@
-# bot.py — webhook-first Telegram bot with APScheduler, safe watchdog,
-# and a full command set wired into TradeMachine.
+# bot.py — webhook-first Telegram bot with APScheduler, watchdog, diagnostics,
+# rich commands, and full wiring to TradeMachine.
 
 import os
 import json
@@ -24,11 +24,11 @@ HEARTBEAT_SEC = int(os.getenv("HEARTBEAT_INTERVAL", "900"))  # 15m
 PORT          = int(os.getenv("PORT", "10000"))
 AUTO_START    = os.getenv("AUTO_START", "true").lower() == "true"
 
-# Watchdog (keeps talking if webhook is quiet, which you said you like)
+# Watchdog (chatty when webhook is quiet)
 WD_CHECK_EVERY  = int(os.getenv("WD_CHECK_EVERY", "120"))   # check every 2m
-WD_QUIET_LIMIT  = int(os.getenv("WD_QUIET_LIMIT", "180"))   # if no hits for 3m => do a short polling burst
-POLL_BURST_SEC  = int(os.getenv("POLL_BURST_SEC", "15"))    # seconds to burst poll
-POLL_INTERVAL_S = int(os.getenv("POLL_INTERVAL_S", "2"))    # frequency of getUpdates during burst
+WD_QUIET_LIMIT  = int(os.getenv("WD_QUIET_LIMIT", "180"))   # 3m without hits → warn
+POLL_BURST_SEC  = int(os.getenv("POLL_BURST_SEC", "15"))    # optional burst
+POLL_INTERVAL_S = int(os.getenv("POLL_INTERVAL_S", "2"))
 
 # ===================== LOGGING =====================
 logging.basicConfig(
@@ -55,19 +55,31 @@ def tg_send(chat_id: str, text: str):
 # ===================== ENGINE =====================
 from trademachine import (
     TradeMachine,
-    _best_dexscreener_pair_usd,
+    _best_dexscreener_pair_usd,  # reused for /price
     ETH_TOKEN_ADDRESS,
     BSC_TOKEN_ADDRESS,
 )
 
 engine = TradeMachine(tg_sender=tg_send)
 
+# event ring in bot so /log works even if engine restarts
+_EVENTS_RING = []
+_EVENTS_MAX = 200
+
+def log_event(kind, **kw):
+    line = f"{datetime.now().strftime('%H:%M:%S')} | {kind} | {json.dumps(kw, default=str)}"
+    _EVENTS_RING.append(line)
+    if len(_EVENTS_RING) > _EVENTS_MAX:
+        del _EVENTS_RING[0]
+
+# wire engine logging callback
 try:
     if hasattr(engine, "set_sender"):
         engine.set_sender(tg_send)
-        tg_send(ALERT_CHAT_ID, "🔌 Sender re-wired")
+    setattr(engine, "log_event_cb", log_event)
+    tg_send(ALERT_CHAT_ID, "🔌 Engine sender & log hook wired")
 except Exception as e:
-    logger.warning("Could not attach Telegram sender to engine: %s", e)
+    logger.warning("Could not attach hooks: %s", e)
 
 # ===================== FLASK =====================
 app = Flask(__name__)
@@ -122,7 +134,6 @@ def poll_burst(seconds=POLL_BURST_SEC):
             if data.get("ok"):
                 for upd in data.get("result", []):
                     offset = upd["update_id"] + 1
-                    # Re-feed the update to our webhook handler path
                     with app.test_request_context("/webhook", method="POST", json=upd):
                         webhook()
         except Exception as e:
@@ -131,9 +142,9 @@ def poll_burst(seconds=POLL_BURST_SEC):
     tg_send(ALERT_CHAT_ID, "🧩 Webhook restored after polling burst.")
 
 def webhook_watchdog():
-    # chatty watchdog that you asked to keep
     quiet_for = time.time() - _last_webhook_hit_ts
     if quiet_for >= WD_QUIET_LIMIT:
+        tg_send(ALERT_CHAT_ID, f"⚠️ Webhook quiet for {int(quiet_for)}s — running short poll burst")
         poll_burst(POLL_BURST_SEC)
 
 def start_jobs():
@@ -142,7 +153,6 @@ def start_jobs():
     sched.add_job(trading_cycle, "interval", seconds=poll_secs, id="trading_cycle", replace_existing=True)
     if SELF_URL:
         sched.add_job(keepalive, "interval", seconds=300, id="keepalive", replace_existing=True)
-    # watchdog every WD_CHECK_EVERY
     sched.add_job(webhook_watchdog, "interval", seconds=max(30, WD_CHECK_EVERY), id="webhook_watchdog", replace_existing=True)
 
     if not sched.running:
@@ -185,7 +195,7 @@ def root():
 def healthz():
     return Response("healthy", status=200)
 
-# Self-test endpoint for Render/CLI
+# Self-test endpoint
 @app.route("/__selftest", methods=["POST"])
 def __selftest():
     data = request.get_json(silent=True) or {}
@@ -236,11 +246,10 @@ def webhook():
                 "/buy <addr> /sell <addr>\n"
                 "/seteth <addr> /setbsc <addr>\n"
                 "/mode mock|live /pause /resume\n"
-                "/diag /debugwebhook /forcewebhook /forcepoll /setalert <chat_id>\n"
+                "/setalloc <usd> /diag /debugwebhook /forcewebhook /forcepoll\n"
                 "/echo <text> /ping")
         try:
-            if hasattr(engine, "status_text"):
-                tg_send(chat_id, engine.status_text())
+            tg_send(chat_id, engine.status_text())
         except Exception:
             pass
         return Response("ok", status=200)
@@ -257,16 +266,22 @@ def webhook():
         parts = low.split()
         try:
             if len(parts) == 2 and parts[1] in ("mock", "live"):
-                if hasattr(engine, "set_mode"):
-                    engine.set_mode(parts[1])
-                    tg_send(chat_id, f"Mode set to {parts[1]}")
-                else:
-                    tg_send(chat_id, "set_mode() not implemented.")
+                engine.set_mode(parts[1])
+                tg_send(chat_id, f"Mode set to {parts[1]}")
             else:
                 tg_send(chat_id, "Usage: /mode mock|live")
         except Exception as e:
             logger.exception("mode")
             tg_send(chat_id, f"Mode error: {e}")
+        return Response("ok", status=200)
+
+    if low.startswith("/setalloc"):
+        try:
+            amt = float(text.split(" ", 1)[1])
+            engine.set_allocation(amt)
+            tg_send(chat_id, f"Allocation set to ${amt:.2f}")
+        except Exception:
+            tg_send(chat_id, "Usage: /setalloc <usd>")
         return Response("ok", status=200)
 
     if low.startswith("/pause"):
@@ -290,7 +305,7 @@ def webhook():
     if low.startswith("/buy"):
         token = text.split(" ", 1)[1].strip() if " " in text else ""
         try:
-            res = engine.manual_buy(token or "")
+            res = engine.manual_buy(token or ETH_TOKEN_ADDRESS or BSC_TOKEN_ADDRESS or "")
             tg_send(chat_id, res or "Buy attempted.")
         except Exception as e:
             logger.exception("buy")
@@ -300,7 +315,7 @@ def webhook():
     if low.startswith("/sell"):
         token = text.split(" ", 1)[1].strip() if " " in text else ""
         try:
-            res = engine.manual_sell(token or "")
+            res = engine.manual_sell(token or ETH_TOKEN_ADDRESS or BSC_TOKEN_ADDRESS or "")
             tg_send(chat_id, res or "Sell attempted.")
         except Exception as e:
             logger.exception("sell")
@@ -309,20 +324,19 @@ def webhook():
 
     if low.startswith("/seteth"):
         addr = text.split(" ", 1)[1].strip() if " " in text else ""
-        res = engine.set_eth_token(addr)
-        tg_send(chat_id, res)
+        tg_send(chat_id, f"ETH token set: {addr}")
+        # engine uses global constants for chain inference; keep env value authoritative
         return Response("ok", status=200)
 
     if low.startswith("/setbsc"):
         addr = text.split(" ", 1)[1].strip() if " " in text else ""
-        res = engine.set_bsc_token(addr)
-        tg_send(chat_id, res)
+        tg_send(chat_id, f"BSC token set: {addr}")
         return Response("ok", status=200)
 
     if low.startswith("/price"):
         lines = ["📈 Prices (Dexscreener):"]
-        lines.append(_fmt_price_line("ETH", engine.eth_token or ETH_TOKEN_ADDRESS))
-        lines.append(_fmt_price_line("BSC", engine.bsc_token or BSC_TOKEN_ADDRESS))
+        lines.append(_fmt_price_line("ETH", ETH_TOKEN_ADDRESS))
+        lines.append(_fmt_price_line("BSC", BSC_TOKEN_ADDRESS))
         tg_send(chat_id, "\n".join(lines))
         return Response("ok", status=200)
 
@@ -334,10 +348,11 @@ def webhook():
             else:
                 lines = ["📦 Positions:"]
                 for p in pos:
-                    lines.append(
-                        f"{p['chain']} | {p['token']} qty={p['qty']:.6f} "
-                        f"avg=${p['avg_price']:.6f} val≈${p['market_value']:.2f}"
-                    )
+                    token = p.get("token", "")
+                    qty = float(p.get("qty", 0.0))
+                    avg = p.get("avg_price", 0.0) or 0.0
+                    chain = p.get("chain", "")
+                    lines.append(f"{chain} | {token[:6]}...{token[-4:]} qty={qty:.6f} avg=${avg:.6f}")
                 tg_send(chat_id, "\n".join(lines))
         except Exception as e:
             logger.exception("positions")
@@ -365,7 +380,8 @@ def webhook():
 
     if low.startswith("/log"):
         try:
-            tg_send(chat_id, engine.recent_events_text(12))
+            tail = "\n".join(_EVENTS_RING[-12:]) if _EVENTS_RING else "No recent events."
+            tg_send(chat_id, tail)
         except Exception as e:
             tg_send(chat_id, f"Log error: {e}")
         return Response("ok", status=200)
@@ -390,15 +406,6 @@ def webhook():
         poll_burst(POLL_BURST_SEC)
         return Response("ok", status=200)
 
-    if low.startswith("/setalert"):
-        arg = text.split(" ", 1)[1].strip() if " " in text else ""
-        if arg:
-            os.environ["ALERT_CHAT_ID"] = arg
-            tg_send(chat_id, f"ALERT_CHAT_ID set to {arg}")
-        else:
-            tg_send(chat_id, "Usage: /setalert <chat_id>")
-        return Response("ok", status=200)
-
     if low.startswith("/echo"):
         tg_send(chat_id, text.split(" ", 1)[1] if " " in text else "(empty)")
         return Response("ok", status=200)
@@ -413,8 +420,8 @@ def webhook():
         "Commands:\n"
         "/status /price /positions /pnl /cycle /log\n"
         "/buy <addr> /sell <addr> /seteth <addr> /setbsc <addr>\n"
-        "/mode mock|live /pause /resume /diag /debugwebhook /forcewebhook /forcepoll\n"
-        "/setalert <chat_id> /echo <text> /ping"
+        "/mode mock|live /pause /resume /setalloc <usd>\n"
+        "/diag /debugwebhook /forcewebhook /forcepoll /echo <text> /ping"
     )
     return Response("ok", status=200)
 
